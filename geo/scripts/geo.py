@@ -14,6 +14,7 @@ Examples:
     python geo.py download GSE2553 --suppl --out ./geo_out
     python geo.py search "breast cancer RNA-seq" --organism "Homo sapiens" --limit 20
     python geo.py metadata-table GSE2553 --out metadata.tsv
+    python geo.py runtable GSE110009 --out .          # SraRunTable.csv + SRR_Acc_List.txt
 """
 import argparse
 import json
@@ -304,6 +305,65 @@ def cmd_samplesheet(args):
           f"(nf-core/{'rnaseq' if args.assay == 'bulk' else 'scrnaseq'})", file=sys.stderr)
 
 
+# ---- SRA Run Selector files (SraRunTable.csv + SRR_Acc_List.txt) ----
+import io
+
+
+def sra_runinfo_csv(project):
+    """Fetch the SRA `runinfo` CSV for a study/project via E-utilities.
+
+    This is the same table the SRA Run Selector serves as SraRunTable.csv. We
+    esearch db=sra (using history so large studies work) then efetch rettype=runinfo.
+    """
+    res = get_json(
+        f"{EUTILS}/esearch.fcgi",
+        {"db": "sra", "term": project, "retmode": "json",
+         "usehistory": "y", "retmax": "0"},
+    )
+    er = res.get("esearchresult", {})
+    webenv, qk = er.get("webenv"), er.get("querykey")
+    if not webenv or not qk or er.get("count", "0") == "0":
+        return ""
+    url = f"{EUTILS}/efetch.fcgi?" + urllib.parse.urlencode(_eutil_params(
+        {"db": "sra", "query_key": qk, "WebEnv": webenv,
+         "rettype": "runinfo", "retmode": "text"}))
+    return http_get(url).decode("utf-8", "replace")
+
+
+def cmd_runtable(args):
+    """Download the SRA Run Selector files for a GEO accession.
+
+    Resolves the linked SRA study / BioProject, then writes SraRunTable.csv (the
+    full runinfo table) and SRR_Acc_List.txt (one run accession per line).
+    """
+    project = resolve_sra_project(args.accession)
+    if not project:
+        raise SystemExit(
+            f"Could not find a linked SRA/BioProject for {args.accession}. "
+            "The series may have no sequencing data in SRA.")
+    print(f"{args.accession} -> SRA project {project}", file=sys.stderr)
+    text = sra_runinfo_csv(project)
+    if not text.strip():
+        raise SystemExit(
+            f"No SRA runinfo returned for {project} (linked to {args.accession}). "
+            "The raw data may be under controlled access or not in SRA.")
+
+    os.makedirs(args.out, exist_ok=True)
+    run_table = os.path.join(args.out, "SraRunTable.csv")
+    with open(run_table, "w", newline="") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+
+    rows = [r for r in csv.reader(io.StringIO(text)) if r]
+    header = rows[0] if rows else []
+    run_idx = header.index("Run") if "Run" in header else 0
+    accs = [r[run_idx].strip() for r in rows[1:] if len(r) > run_idx and r[run_idx].strip()]
+    acc_list = os.path.join(args.out, "SRR_Acc_List.txt")
+    with open(acc_list, "w") as fh:
+        fh.write("\n".join(accs) + ("\n" if accs else ""))
+
+    print(f"Wrote {run_table} ({len(accs)} run(s)) and {acc_list}", file=sys.stderr)
+
+
 # ---- harmonized metadata.tsv (shared shape across skills) ----
 import html
 
@@ -521,6 +581,12 @@ def main():
     mt.add_argument("accession", help="GSE accession")
     mt.add_argument("--out", default="metadata.tsv")
     mt.set_defaults(func=cmd_metadata_table)
+
+    rt = sub.add_parser("runtable",
+                        help="Download SRA Run Selector files (SraRunTable.csv + SRR_Acc_List.txt)")
+    rt.add_argument("accession", help="GSE (or GSM) accession")
+    rt.add_argument("--out", default=".", help="output directory (default current dir)")
+    rt.set_defaults(func=cmd_runtable)
 
     ss = sub.add_parser("samplesheet",
                         help="Build an nf-core samplesheet.csv via the linked SRA/ENA data (--assay scrna|bulk)")

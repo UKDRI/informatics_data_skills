@@ -5,10 +5,11 @@ description: >-
   Use when working with GEO accessions (GSE series, GSM samples, GPL platforms,
   GDS datasets) — to search GEO DataSets, fetch series/sample metadata, list
   supplementary/raw files, download series matrix, SOFT, MINiML, and
-  supplementary files, or build an nf-core/scrnaseq or nf-core/rnaseq
-  samplesheet.csv from the linked SRA/ENA data. Triggers: "GEO", "GSE", "GSM",
-  "gene expression omnibus", "series matrix", "GEO supplementary", "samplesheet",
-  "rnaseq", "scrnaseq".
+  supplementary files, build an nf-core/scrnaseq or nf-core/rnaseq samplesheet.csv
+  from the linked SRA/ENA data, or download the SRA Run Selector files
+  (SraRunTable.csv, SRR_Acc_List.txt). Triggers: "GEO", "GSE", "GSM", "gene
+  expression omnibus", "series matrix", "GEO supplementary", "samplesheet",
+  "rnaseq", "scrnaseq", "SraRunTable", "SRR_Acc_List", "SRA Run Selector".
 ---
 
 # GEO (Gene Expression Omnibus)
@@ -40,9 +41,31 @@ python scripts/geo.py search "breast cancer RNA-seq" --organism "Homo sapiens" -
 python scripts/geo.py samplesheet GSE110009 --assay scrna --out samplesheet.csv  # nf-core/scrnaseq
 python scripts/geo.py samplesheet GSE110009 --assay bulk  --out samplesheet.csv  # nf-core/rnaseq
 python scripts/geo.py metadata-table GSE2553 --out metadata.tsv     # harmonized sample table
+python scripts/geo.py runtable GSE110009 --out .    # SraRunTable.csv + SRR_Acc_List.txt
 ```
 
 Add `--json` to any query command for machine-readable output.
+
+## SRA Run Selector files (`runtable`)
+
+`runtable` reproduces the two files the
+[SRA Run Selector](https://www.ncbi.nlm.nih.gov/Traces/study/) offers for a study:
+
+- **`SraRunTable.csv`** — the full SRA `runinfo` table (run/experiment/sample
+  accessions, library layout, platform, sizes, BioSample/BioProject, taxonomy, …).
+- **`SRR_Acc_List.txt`** — the run accessions, one per line (the `Run` column).
+
+It resolves the SRA study / BioProject linked to the GEO accession, then fetches
+the table via E-utilities (`esearch` + `efetch db=sra rettype=runinfo`).
+
+```bash
+python scripts/geo.py runtable GSE110009 --out ./GSE110009
+```
+
+- `SRR_Acc_List.txt` feeds `prefetch`/`fasterq-dump` (SRA Toolkit); for ENA FASTQ
+  URLs use `samplesheet` or the `ena` skill instead.
+- If the series has no SRA data (or it is controlled-access), the command reports
+  it rather than writing empty files.
 
 ## Metadata table (metadata.tsv)
 
