@@ -6,9 +6,9 @@ description: >-
   ArrayExpress accessions (E-MTAB, E-GEOD, E-MEXP, E-PROT...) — to fetch study
   metadata, list and classify files (IDF/SDRF MAGE-TAB, raw, processed), print the
   SDRF experimental design, download data by category, or build an
-  nf-core/scrnaseq samplesheet.csv from the SDRF. Triggers: "ArrayExpress",
-  "E-MTAB", "MAGE-TAB", "SDRF", "IDF", "functional genomics experiment",
-  "microarray experiment EBI", "samplesheet".
+  nf-core/scrnaseq or nf-core/rnaseq samplesheet.csv from the SDRF. Triggers:
+  "ArrayExpress", "E-MTAB", "MAGE-TAB", "SDRF", "IDF", "functional genomics
+  experiment", "microarray experiment EBI", "samplesheet", "rnaseq", "scrnaseq".
 ---
 
 # ArrayExpress (EMBL functional genomics)
@@ -40,23 +40,47 @@ python scripts/arrayexpress.py download E-MTAB-11448 --magetab --out ./out
 python scripts/arrayexpress.py download E-MTAB-11448 --processed --out ./out
 python scripts/arrayexpress.py download E-MTAB-11448 --raw --out ./out
 python scripts/arrayexpress.py search   "single cell heart" --limit 20
-python scripts/arrayexpress.py samplesheet E-MTAB-13991 --out samplesheet.csv  # nf-core/scrnaseq
+python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay scrna  # nf-core/scrnaseq
+python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay bulk   # nf-core/rnaseq
+python scripts/arrayexpress.py metadata-table E-MTAB-11448 --out metadata.tsv  # harmonized sample table
 ```
 
 Add `--json` to `metadata`/`files`/`search` for machine-readable output.
 
-## Samplesheet (nf-core/scrnaseq)
+## Metadata table (metadata.tsv)
 
-`samplesheet` parses the study's **SDRF** and writes a
-[nf-core/scrnaseq](https://nf-co.re/scrnaseq/4.2.0/docs/usage/#samplesheet-input)
-sheet (`sample,fastq_1,fastq_2`). It reads `Source Name` (→ `sample`),
-`Comment[ENA_RUN]`, and `Comment[FASTQ_URI]`, grouping the R1/R2 rows of each run
-into one samplesheet row. If a run has no `FASTQ_URI`, the FASTQ links are fetched
-from ENA by run accession.
+`metadata-table` parses the study's **SDRF** into the harmonized, tab-delimited
+`metadata.tsv` shared across all repository skills: **one row per SDRF row (sample
+× replicate)** with the core columns `sample, replicate, species, sex, age,
+condition, genotype, treatment, tissue`. `Source Name` becomes `sample`, a
+technical/biological replicate column (or `1`) becomes `replicate`, and the
+`Characteristics[...]` / `FactorValue[...]` columns are mapped to the core fields.
+Any characteristic that doesn't map to a core field is **promoted to its own
+column**, so nothing is dropped. When a row carries a BioSample id (`Source Name`
+or `Comment[BioSD_SAMPLE]`), the EBI BioSamples API is queried to fill missing and
+extra fields. **Missing fields are `NA`.**
 
 ```bash
-python scripts/arrayexpress.py samplesheet E-MTAB-13991                 # FASTQ URLs
-python scripts/arrayexpress.py samplesheet E-MTAB-13991 --local-dir ./fastq
+python scripts/arrayexpress.py metadata-table E-MTAB-11448 --out metadata.tsv
+```
+
+## Samplesheet (nf-core/scrnaseq or /rnaseq)
+
+`samplesheet` parses the study's **SDRF** and writes an nf-core sample sheet. It
+reads `Source Name` (→ `sample`), `Comment[ENA_RUN]`, and `Comment[FASTQ_URI]`,
+grouping the R1/R2 rows of each run into one samplesheet row. If a run has no
+`FASTQ_URI`, the FASTQ links are fetched from ENA by run accession. **`--assay` is
+required** — the archive can't tell you whether the study is single-cell or bulk:
+
+- `--assay scrna` → [nf-core/scrnaseq](https://nf-co.re/scrnaseq/4.2.0/docs/usage/#samplesheet-input)
+  columns `sample,fastq_1,fastq_2`.
+- `--assay bulk` → [nf-core/rnaseq](https://nf-co.re/rnaseq/3.26.0/docs/usage#samplesheet-input)
+  columns `sample,fastq_1,fastq_2,strandedness` (`--strandedness`, default `auto`).
+
+```bash
+python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay scrna              # FASTQ URLs
+python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay bulk --strandedness reverse
+python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay scrna --local-dir ./fastq
 ```
 
 - Errors clearly if the SDRF has no FASTQ (e.g. array-only studies, or reads only

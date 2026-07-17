@@ -36,9 +36,29 @@ python scripts/pride.py download PXD000001 --ext mzid --out ./out
 python scripts/pride.py search   "phosphoproteome" --limit 20
 python scripts/pride.py samplesheet     PXD000561                        # <acc>.sdrf.tsv
 python scripts/pride.py download-script PXD000561 --ext raw --out dl.sh   # bash + SLURM script
+python scripts/pride.py metadata-table  PXD000561 --out metadata.tsv      # harmonized sample table
 ```
 
 Add `--json` to any query command for machine-readable output.
+
+## Metadata table (metadata.tsv)
+
+`metadata-table` writes the harmonized, tab-delimited `metadata.tsv` shared across
+all repository skills: **one row per sample × replicate** with the core columns
+`sample, replicate, species, sex, age, condition, genotype, treatment, tissue`.
+When the project has a submitter SDRF it is parsed (`source name` → `sample`,
+technical/biological replicate → `replicate`, and the `characteristics[...]` /
+`factor value[...]` columns → the core fields). Without an SDRF, a single
+project-level row is emitted from the PRIDE organism/disease/instrument metadata.
+Any characteristic that doesn't map to a core field is **promoted to its own
+column**, so nothing is dropped. When a `source name` is a BioSample id
+(`SAME*`/`SAMEA*`/`SAMN*`/`SAMD*`), the EBI BioSamples API is queried to fill
+missing and extra fields. **Missing fields are `NA`.** This is the
+sample-annotation view; for the pipeline-input SDRF use `samplesheet`.
+
+```bash
+python scripts/pride.py metadata-table PXD000561 --out metadata.tsv
+```
 
 ## Sample sheet (minimal SDRF)
 

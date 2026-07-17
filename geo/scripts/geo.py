@@ -13,6 +13,7 @@ Examples:
     python geo.py download GSE2553 --matrix --out ./geo_out
     python geo.py download GSE2553 --suppl --out ./geo_out
     python geo.py search "breast cancer RNA-seq" --organism "Homo sapiens" --limit 20
+    python geo.py metadata-table GSE2553 --out metadata.tsv
 """
 import argparse
 import json
@@ -257,6 +258,25 @@ def ena_runs(project):
     return [dict(zip(header, ln.split("\t"))) for ln in lines[1:]]
 
 
+def write_samplesheet(rows, out, assay, strandedness="auto"):
+    """Write an nf-core sample sheet.
+
+    assay 'scrna' → nf-core/scrnaseq columns (sample,fastq_1,fastq_2);
+    assay 'bulk'  → nf-core/rnaseq columns (+ strandedness).
+    """
+    cols = list(SAMPLESHEET_COLS) + (["strandedness"] if assay == "bulk" else [])
+    rows = sorted(rows, key=lambda x: (x["sample"], x["fastq_1"]))
+    with open(out, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        for r in rows:
+            row = dict(r)
+            if assay == "bulk":
+                row["strandedness"] = strandedness
+            w.writerow([row.get(c, "") for c in cols])
+    return len(rows)
+
+
 def cmd_samplesheet(args):
     project = resolve_sra_project(args.accession)
     if not project:
@@ -279,13 +299,156 @@ def cmd_samplesheet(args):
             f2 = os.path.join(args.local_dir, run, f2.rsplit("/", 1)[-1]) if f2 else ""
         sample = r.get(args.group_by) or r.get("sample_accession") or r.get("run_accession")
         rows.append({"sample": clean_sample(sample), "fastq_1": f1, "fastq_2": f2})
-    rows.sort(key=lambda x: (x["sample"], x["fastq_1"]))
-    with open(args.out, "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(SAMPLESHEET_COLS)
+    n = write_samplesheet(rows, args.out, args.assay, args.strandedness)
+    print(f"Wrote {n} row(s) for {len({r['sample'] for r in rows})} sample(s) to {args.out} "
+          f"(nf-core/{'rnaseq' if args.assay == 'bulk' else 'scrnaseq'})", file=sys.stderr)
+
+
+# ---- harmonized metadata.tsv (shared shape across skills) ----
+import html
+
+METADATA_COLS = ["sample", "replicate", "species", "sex", "age",
+                 "condition", "genotype", "treatment", "tissue"]
+NA = "NA"
+
+FIELD_KEYS = {
+    "species": ["organism", "scientific_name", "species", "organism scientific name"],
+    "sex": ["sex", "gender"],
+    "age": ["age", "developmental stage", "dev stage", "age at collection", "age at sampling"],
+    "condition": ["disease", "disease state", "condition", "phenotype",
+                  "health state", "clinical information", "diagnosis"],
+    "genotype": ["genotype", "genotype/variation", "variation", "strain",
+                 "strain/background", "background"],
+    "treatment": ["treatment", "agent", "compound", "stimulus",
+                  "perturbation", "dose", "treatment protocol"],
+    "tissue": ["tissue", "organism part", "tissue type", "tissue region", "source tissue"],
+}
+_REPLICATE_KEYS = ("replicate", "biological replicate", "technical replicate",
+                   "replicate number")
+_IDENTITY_KEYS = ("source name", "sample", "sample name", "sample_accession",
+                  "run_accession", "assay name", "name", "title")
+_NULLS = {"", "na", "n/a", "none", "null", "unknown", "not applicable",
+          "not available", "not collected", "not provided", "missing", "--"}
+
+
+def _norm_key(k):
+    k = (k or "").strip().lower()
+    m = re.match(r"(?:characteristics|comment|factor\s*value|factorvalue)\s*\[(.+)\]$", k)
+    return m.group(1).strip() if m else k
+
+
+def _clean_val(v):
+    v = re.sub(r"\s+", " ", html.unescape(v or "").strip())
+    return "" if v.lower() in _NULLS else v
+
+
+def _col_name(k):
+    """Column-safe name for a promoted extra characteristic."""
+    return re.sub(r"[^0-9a-z]+", "_", k.strip().lower()).strip("_") or "field"
+
+
+def harmonize_row(sample, replicate, attrs):
+    """Map source-native (name -> value) annotations onto the metadata columns.
+
+    Core fields (METADATA_COLS) are always present; missing ones become 'NA'. Every
+    other characteristic is promoted to its own column so nothing is dropped.
+    """
+    norm = {}
+    for k, v in (attrs or {}).items():
+        nk, cv = _norm_key(k), _clean_val(v)
+        if nk and cv and nk not in norm:
+            norm[nk] = cv
+    row = {"sample": _clean_val(sample) or NA,
+           "replicate": _clean_val(replicate) or NA}
+    used = set(_REPLICATE_KEYS) | set(_IDENTITY_KEYS)
+    for field, keys in FIELD_KEYS.items():
+        used.update(keys)  # every synonym is consumed, not just the matched one
+        val = ""
+        for cand in keys:
+            if norm.get(cand):
+                val = norm[cand]
+                break
+        row[field] = val or NA
+    for k, v in norm.items():
+        if k not in used:
+            row.setdefault(_col_name(k), v)
+    return row
+
+
+def write_metadata_tsv(rows, out):
+    """Write rows as TSV; header = core columns + union of any extra columns."""
+    header = list(METADATA_COLS)
+    for r in rows:
+        for k in r:
+            if k not in header:
+                header.append(k)
+    with open(out, "w", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(header)
         for r in rows:
-            w.writerow([r.get(c, "") for c in SAMPLESHEET_COLS])
-    print(f"Wrote {len(rows)} row(s) for {len({r['sample'] for r in rows})} sample(s) to {args.out}",
+            w.writerow([r.get(c, NA) for c in header])
+    return len(rows), len(header)
+
+
+def geo_sample_soft(gsm):
+    url = ("https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc="
+           + gsm + "&targ=self&form=text&view=quick")
+    return http_get(url).decode("utf-8", "replace")
+
+
+def parse_geo_sample(text):
+    """Pull organism + `!Sample_characteristics_ch*` (tag: value) from SOFT text."""
+    attrs = {}
+    organism = ""
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if "=" not in ln:
+            continue
+        key, _, val = ln.partition("=")
+        key, val = key.strip(), val.strip()
+        if key.startswith("!Sample_organism") and val:
+            organism = val
+        elif key.startswith("!Sample_characteristics") and val:
+            if ":" in val:
+                tag, tv = val.split(":", 1)
+                attrs.setdefault(tag.strip(), tv.strip())
+            else:
+                attrs.setdefault(val, "")
+    if organism:
+        attrs.setdefault("organism", organism)
+    return attrs
+
+
+def cmd_metadata_table(args):
+    """Write a harmonized metadata.tsv (one row per sample/GSM).
+
+    Per-sample characteristics are read from each GSM's SOFT record; each GSM is a
+    row, with `replicate` taken from a replicate characteristic when present else 1.
+    """
+    _, rec = resolve_uid(args.accession)
+    samples = rec.get("samples", [])
+    if not samples:
+        raise SystemExit(
+            f"No sample list in the GEO summary for {args.accession}; "
+            "cannot build a per-sample metadata table.")
+    rows = []
+    for s in samples:
+        gsm = s.get("accession", "")
+        attrs = {}
+        if gsm:
+            try:
+                attrs = parse_geo_sample(geo_sample_soft(gsm))
+            except SystemExit:
+                attrs = {}
+        attrs.setdefault("organism", rec.get("taxon", ""))
+        replicate = ""
+        for k, v in attrs.items():
+            if _norm_key(k) in _REPLICATE_KEYS and v:
+                replicate = v
+                break
+        rows.append(harmonize_row(gsm or s.get("title", ""), replicate or "1", attrs))
+    n, ncols = write_metadata_tsv(rows, args.out)
+    print(f"Wrote {n} sample row(s) x {ncols} column(s) for {args.accession} to {args.out}",
           file=sys.stderr)
 
 
@@ -353,9 +516,21 @@ def main():
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_search)
 
+    mt = sub.add_parser("metadata-table",
+                        help="Write a harmonized metadata.tsv (one row per sample/GSM)")
+    mt.add_argument("accession", help="GSE accession")
+    mt.add_argument("--out", default="metadata.tsv")
+    mt.set_defaults(func=cmd_metadata_table)
+
     ss = sub.add_parser("samplesheet",
-                        help="Build an nf-core/scrnaseq samplesheet.csv via the linked SRA/ENA data")
+                        help="Build an nf-core samplesheet.csv via the linked SRA/ENA data (--assay scrna|bulk)")
     ss.add_argument("accession", help="GSE (or GSM) accession")
+    ss.add_argument("--assay", choices=["scrna", "bulk"], required=True,
+                    help="scrna -> nf-core/scrnaseq (sample,fastq_1,fastq_2); "
+                         "bulk -> nf-core/rnaseq (adds a strandedness column)")
+    ss.add_argument("--strandedness", choices=["auto", "forward", "reverse", "unstranded"],
+                    default="auto",
+                    help="value for the rnaseq strandedness column (only --assay bulk; default auto)")
     ss.add_argument("--out", default="samplesheet.csv")
     ss.add_argument("--group-by", default="sample_accession",
                     help="ENA run field for the `sample` column "
