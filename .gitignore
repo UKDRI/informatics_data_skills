@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Generated outputs
+*.sdrf.tsv
+samplesheet.csv
+download_fastq.sh
+download_pride.sh
+/geo_out/
+/ena_out/
+/pride_out/
+/pride_data/
+/bs_out/
+/ae_out/
+/fastq/
