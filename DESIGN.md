@@ -10,8 +10,9 @@ Give an agent (or a human at the CLI) one consistent, dependency-free way to:
 
 1. **Search** each repository and **fetch metadata** for an accession.
 2. **List** and **download** the associated data files.
-3. Produce **pipeline inputs** — nf-core/scrnaseq sample sheets, quantms/DIA-NN
-   minimal SDRFs, and SLURM-ready bash download scripts.
+3. Produce **pipeline inputs** — a harmonized `metadata.tsv` sample table,
+   nf-core/scrnaseq or nf-core/rnaseq sample sheets, quantms/DIA-NN minimal SDRFs, and SLURM-ready
+   bash download scripts.
 
 Data sources covered:
 
@@ -111,16 +112,86 @@ name is the skill `name`; `SKILL.md` frontmatter carries the trigger-rich
   enumerates them. Download URL = `/biostudies/files/{acc}/{path}`.
 
 ### fastq-download-script (generator)
-- Pure transform: reads an nf-core/scrnaseq sample sheet (or a plain URL list)
-  and emits a bash script. No network calls.
+- Pure transform: reads an nf-core/scrnaseq or /rnaseq sample sheet (it keys off
+  the `fastq_*` columns, so the extra `strandedness` column is ignored) or a plain
+  URL list, and emits a bash script. No network calls.
+
+## Cross-cutting feature: harmonized metadata table
+
+Every repository skill (`geo`, `ena`, `pride`, `arrayexpress`, `biostudies`)
+exposes a **`metadata-table`** command that writes a **`metadata.tsv`** (default
+`--out metadata.tsv`) — a single tab-delimited table that harmonizes each source's
+native, differently-named sample annotations into one common schema. This is the
+upstream, human-readable view of a study; the sample-sheet builders below consume
+the same underlying records.
+
+- **One row per sample × replicate.** Each biological sample is emitted once per
+  replicate (technical or biological, as the source reports them), so a study with
+  three samples in duplicate produces six rows.
+- **Tab-delimited**, `.tsv` extension, with a header row. Chosen over CSV because
+  free-text annotation fields (condition, treatment, additional information)
+  routinely contain commas.
+- **Core columns, always present, in this order:**
+
+  | Column | Meaning |
+  |--------|---------|
+  | `sample` | sample identifier / accession (source-native) |
+  | `replicate` | replicate label or number within the sample |
+  | `species` | organism, scientific name where available |
+  | `sex` | sex of the organism |
+  | `age` | age of the organism / at sampling |
+  | `condition` | disease state or experimental condition |
+  | `genotype` | genotype / strain |
+  | `treatment` | treatment or perturbation applied |
+  | `tissue` | sampled tissue / organism part |
+
+- **Dynamic extra columns.** Any further characteristic obtained from a metadata
+  query that does not map to a core field is **promoted to its own column** (name
+  sanitised, e.g. `cell type` → `cell_type`). The header is the core columns
+  followed by the union of every extra characteristic seen across the study's
+  samples, so nothing is silently dropped and the width varies per study.
+- **Missing → `NA`.** When a row has no value for a column — a core field the
+  source omitted, or an extra column another sample contributed — the cell is the
+  literal string `NA` rather than empty, so every row has the full column set and
+  the table is unambiguous to parse.
+- **BioSample enrichment.** When a sample identifier is a BioSample accession
+  (`SAME*` / `SAMEA*` / `SAMN*` / `SAMD*`), the EBI BioSamples API
+  (`/biosamples/samples/{acc}`) is queried to fill missing core fields and add its
+  extra characteristics. GEO `GSM*` samples are resolved through GEO (SOFT), and
+  ENA already carries this data in the sample XML, so neither issues a second call.
+
+Each source maps its native metadata into this schema:
+
+```
+ena          filereport / sample XML characteristics ──► columns
+geo          SOFT sample characteristics (Sample_characteristics_ch*) ──► columns
+pride        project sample metadata / SDRF characteristics ──► columns
+arrayexpress SDRF (Characteristics[...], FactorValue[...]) ──► columns
+biostudies   PageTab section attributes ──► columns
+```
+
+Field names differ across repositories (e.g. `Characteristics[organism]`,
+`sample_characteristics`, `organism`); each skill owns the mapping from its native
+keys to the core columns and promotes every unmatched characteristic to its own
+extra column.
 
 ## Cross-cutting feature: sample sheets
 
 Two distinct sample-sheet formats, chosen by domain:
 
-### Sequencing → nf-core/scrnaseq (`geo`, `ena`, `arrayexpress`)
-Columns `sample,fastq_1,fastq_2` per the
-[nf-core/scrnaseq spec](https://nf-co.re/scrnaseq/4.2.0/docs/usage/#samplesheet-input).
+### Sequencing → nf-core (`geo`, `ena`, `arrayexpress`)
+The `samplesheet` command targets one of two nf-core pipelines, selected with the
+**required `--assay` flag** — the caller states whether the study is single-cell or
+bulk, because it cannot be reliably inferred from the metadata:
+
+- **`--assay scrna`** → nf-core/scrnaseq: columns `sample,fastq_1,fastq_2`
+  ([spec](https://nf-co.re/scrnaseq/4.2.0/docs/usage/#samplesheet-input)).
+- **`--assay bulk`** → nf-core/rnaseq: columns `sample,fastq_1,fastq_2,strandedness`
+  ([spec](https://nf-co.re/rnaseq/3.26.0/docs/usage#samplesheet-input)). The extra
+  `strandedness` column is set from `--strandedness` (one of
+  `auto`/`forward`/`reverse`/`unstranded`, default `auto` — the pipeline infers it
+  by subsampling), since the archives do not expose per-run strandedness.
+
 One row per run; rows sharing a `sample` value are concatenated by the pipeline.
 
 - **Pairing**: R1/R2 detected from filename (`_1`/`_2`, `R1`/`R2`); index reads
@@ -184,12 +255,19 @@ fastq-download-script samplesheet.csv --tool curl ─► download_fastq.sh ─�
    resolve to ENA. GEO uses the lightweight SOFT text endpoint
    (`acc.cgi?...&form=text&view=brief`) to find the linked BioProject/SRA rather
    than downloading the (large) series matrix.
-4. **Two sample-sheet formats, not one** — sequencing and proteomics pipelines
-   expect fundamentally different inputs; forcing one schema would be wrong for both.
-5. **Complete rather than reject** — the PRIDE SDRF path fills gaps with reviewed
+4. **One harmonized metadata schema across all sources** — repositories name the
+   same biological facts differently; mapping them to a shared core column set
+   (with `NA` for absent fields) while promoting any further characteristic to its
+   own column gives a uniform, parseable view without discarding source-specific
+   detail. Sample IDs that are BioSamples are enriched from the EBI BioSamples API.
+5. **Sample-sheet format follows the pipeline, not one fixed schema** — proteomics
+   (quantms SDRF) and sequencing differ fundamentally, and within sequencing
+   nf-core/scrnaseq and nf-core/rnaseq differ (the latter adds `strandedness`). The
+   `samplesheet` command emits the format the chosen pipeline expects (`--assay`).
+6. **Complete rather than reject** — the PRIDE SDRF path fills gaps with reviewed
    placeholders so the output always validates, instead of failing when a
    submitter omitted columns.
-6. **Endpoints verified live** — the API shapes were confirmed against the running
+7. **Endpoints verified live** — the API shapes were confirmed against the running
    services (PRIDE v3 paths, ENA field lists, BioStudies file tree) rather than
    assumed from memory, because these APIs drift.
 

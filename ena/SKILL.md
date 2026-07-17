@@ -6,9 +6,10 @@ description: >-
   accessions (PRJEB/PRJNA studies, ERR/SRR/DRR runs, ERX/SRX experiments,
   SAMEA/SAMN samples, ERZ analyses) — to list runs and FASTQ download links,
   build custom file reports, run advanced metadata searches, download FASTQ /
-  submitted files, or generate an nf-core/scrnaseq samplesheet.csv. Triggers:
-  "ENA", "European Nucleotide Archive", "SRA", "FASTQ", "PRJEB", "PRJNA", "ERR",
-  "SRR", "run accession", "filereport", "samplesheet".
+  submitted files, or generate an nf-core/scrnaseq or nf-core/rnaseq
+  samplesheet.csv. Triggers: "ENA", "European Nucleotide Archive", "SRA", "FASTQ",
+  "PRJEB", "PRJNA", "ERR", "SRR", "run accession", "filereport", "samplesheet",
+  "rnaseq", "scrnaseq".
 ---
 
 # ENA (European Nucleotide Archive)
@@ -40,23 +41,48 @@ python scripts/ena.py fields --result read_run       # list all available fields
 python scripts/ena.py search --result read_run --query 'tax_eq(9606) AND library_strategy="RNA-Seq"' --limit 20
 python scripts/ena.py xml SAMEA1968848               # raw record (XML/JSON/EMBL/FASTA)
 python scripts/ena.py download PRJEB1787 --out ./out # download all FASTQ files
-python scripts/ena.py samplesheet PRJEB1787 --out samplesheet.csv   # nf-core/scrnaseq sheet
+python scripts/ena.py samplesheet PRJEB1787 --assay scrna --out samplesheet.csv   # nf-core/scrnaseq
+python scripts/ena.py samplesheet PRJEB1787 --assay bulk  --out samplesheet.csv   # nf-core/rnaseq
+python scripts/ena.py metadata-table PRJEB1787 --out metadata.tsv   # harmonized sample table
 ```
 
 Add `--json` to `runs`/`report`/`search` for JSON output.
 
-## Samplesheet (nf-core/scrnaseq)
+## Metadata table (metadata.tsv)
 
-`samplesheet` writes a CSV with the columns
-[nf-core/scrnaseq](https://nf-co.re/scrnaseq/4.2.0/docs/usage/#samplesheet-input)
-expects — `sample,fastq_1,fastq_2` — one row per run, with `fastq_1`/`fastq_2`
-resolved to the ENA FASTQ URLs (paired reads matched by `_1`/`_2` / `R1`/`R2`).
-Runs from the same sample share the `sample` value so the pipeline concatenates them.
+`metadata-table` writes the harmonized, tab-delimited `metadata.tsv` shared across
+all repository skills: **one row per sample × run (replicate)** with the core
+columns `sample, replicate, species, sex, age, condition, genotype, treatment,
+tissue`. Species comes from `scientific_name`; the other core fields are matched
+from each sample's `SAMPLE_ATTRIBUTES` (fetched from the Browser API sample XML).
+Any further characteristic that doesn't map to a core field is **promoted to its
+own column** (header = core columns + the union of extras across samples), so
+nothing is dropped. **Missing fields are `NA`.**
 
 ```bash
-python scripts/ena.py samplesheet PRJEB1787                       # ENA https URLs
-python scripts/ena.py samplesheet PRJEB1787 --group-by sample_title
-python scripts/ena.py samplesheet PRJEB1787 --local-dir ./ena_out/PRJEB1787
+python scripts/ena.py metadata-table PRJEB1787 --out metadata.tsv
+```
+
+## Samplesheet (nf-core/scrnaseq or /rnaseq)
+
+`samplesheet` writes an nf-core sample sheet, one row per run, with
+`fastq_1`/`fastq_2` resolved to the ENA FASTQ URLs (paired reads matched by
+`_1`/`_2` / `R1`/`R2`). Runs from the same sample share the `sample` value so the
+pipeline concatenates them. **`--assay` is required** — the archive can't tell you
+whether the study is single-cell or bulk:
+
+- `--assay scrna` → [nf-core/scrnaseq](https://nf-co.re/scrnaseq/4.2.0/docs/usage/#samplesheet-input)
+  columns `sample,fastq_1,fastq_2`.
+- `--assay bulk` → [nf-core/rnaseq](https://nf-co.re/rnaseq/3.26.0/docs/usage#samplesheet-input)
+  columns `sample,fastq_1,fastq_2,strandedness`. Set `--strandedness`
+  (`auto`/`forward`/`reverse`/`unstranded`, default `auto`; `auto` lets the
+  pipeline infer it).
+
+```bash
+python scripts/ena.py samplesheet PRJEB1787 --assay scrna                  # ENA https URLs
+python scripts/ena.py samplesheet PRJEB1787 --assay bulk --strandedness reverse
+python scripts/ena.py samplesheet PRJEB1787 --assay scrna --group-by sample_title
+python scripts/ena.py samplesheet PRJEB1787 --assay bulk --local-dir ./ena_out/PRJEB1787
 ```
 
 - `--group-by` chooses which run field becomes `sample` (default

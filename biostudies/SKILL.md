@@ -39,9 +39,28 @@ python scripts/biostudies.py download S-BSST123 --out ./out
 python scripts/biostudies.py download S-BSST123 --match .csv --out ./out
 python scripts/biostudies.py search   "spatial transcriptomics" --limit 20
 python scripts/biostudies.py search   "cancer" --collection BioImages
+python scripts/biostudies.py metadata-table S-BSST123 --out metadata.tsv   # harmonized sample table
 ```
 
 Add `--json` to any query command for machine-readable output.
+
+## Metadata table (metadata.tsv)
+
+`metadata-table` writes the harmonized, tab-delimited `metadata.tsv` shared across
+all repository skills: **one row per sample subsection** with the core columns
+`sample, replicate, species, sex, age, condition, genotype, treatment, tissue`.
+Because BioStudies is heterogeneous, this is best-effort: it locates sample-like
+subsections in the PageTab tree (type mentions "sample", or attributes carry an
+organism) and maps their attributes to the core fields, **promoting** any
+unmatched characteristic to its own column so nothing is dropped. When a sample's
+id is a BioSample (`SAME*`/`SAMEA*`/`SAMN*`/`SAMD*`), the EBI BioSamples API is
+queried to fill missing and extra fields. When a study has no per-sample structure,
+a single study-level row is emitted from the section attributes. **Missing fields
+are `NA`.**
+
+```bash
+python scripts/biostudies.py metadata-table S-BSST123 --out metadata.tsv
+```
 
 ## How access works (for ad-hoc queries)
 

@@ -5,9 +5,10 @@ description: >-
   Use when working with GEO accessions (GSE series, GSM samples, GPL platforms,
   GDS datasets) — to search GEO DataSets, fetch series/sample metadata, list
   supplementary/raw files, download series matrix, SOFT, MINiML, and
-  supplementary files, or build an nf-core/scrnaseq samplesheet.csv from the
-  linked SRA/ENA data. Triggers: "GEO", "GSE", "GSM", "gene expression omnibus",
-  "series matrix", "GEO supplementary", "samplesheet".
+  supplementary files, or build an nf-core/scrnaseq or nf-core/rnaseq
+  samplesheet.csv from the linked SRA/ENA data. Triggers: "GEO", "GSE", "GSM",
+  "gene expression omnibus", "series matrix", "GEO supplementary", "samplesheet",
+  "rnaseq", "scrnaseq".
 ---
 
 # GEO (Gene Expression Omnibus)
@@ -36,23 +37,47 @@ python scripts/geo.py files    GSE2553          # list FTP files (matrix/soft/mi
 python scripts/geo.py download GSE2553 --matrix --out ./out   # series matrix
 python scripts/geo.py download GSE2553 --suppl  --out ./out   # raw/supplementary
 python scripts/geo.py search "breast cancer RNA-seq" --organism "Homo sapiens" --type gse
-python scripts/geo.py samplesheet GSE110009 --out samplesheet.csv   # nf-core/scrnaseq sheet
+python scripts/geo.py samplesheet GSE110009 --assay scrna --out samplesheet.csv  # nf-core/scrnaseq
+python scripts/geo.py samplesheet GSE110009 --assay bulk  --out samplesheet.csv  # nf-core/rnaseq
+python scripts/geo.py metadata-table GSE2553 --out metadata.tsv     # harmonized sample table
 ```
 
 Add `--json` to any query command for machine-readable output.
 
-## Samplesheet (nf-core/scrnaseq)
+## Metadata table (metadata.tsv)
+
+`metadata-table` writes the harmonized, tab-delimited `metadata.tsv` shared across
+all repository skills: **one row per sample (GSM)** with the core columns
+`sample, replicate, species, sex, age, condition, genotype, treatment, tissue`.
+Species comes from `!Sample_organism_ch*`; the other core fields are matched from
+each sample's `!Sample_characteristics_ch*` (`tag: value`) lines in its SOFT
+record. Any further characteristic is **promoted to its own column** (header = core
+columns + the union of extras across samples), so nothing is dropped. `replicate`
+is a replicate characteristic when the submitter provides one, else `1`. **Missing
+fields are `NA`.**
+
+```bash
+python scripts/geo.py metadata-table GSE2553 --out metadata.tsv
+```
+
+Note: this fetches one SOFT record per sample, so large series take a while.
+
+## Samplesheet (nf-core/scrnaseq or /rnaseq)
 
 GEO does not host raw reads — they live in SRA/ENA. `samplesheet` resolves the
 SRA study / BioProject linked to a GEO series (from the series relations), pulls
-the FASTQ links from ENA, and writes a
-[nf-core/scrnaseq](https://nf-co.re/scrnaseq/4.2.0/docs/usage/#samplesheet-input)
-sheet (`sample,fastq_1,fastq_2`).
+the FASTQ links from ENA, and writes an nf-core sample sheet. **`--assay` is
+required** — the archive can't tell you whether the study is single-cell or bulk:
+
+- `--assay scrna` → [nf-core/scrnaseq](https://nf-co.re/scrnaseq/4.2.0/docs/usage/#samplesheet-input)
+  columns `sample,fastq_1,fastq_2`.
+- `--assay bulk` → [nf-core/rnaseq](https://nf-co.re/rnaseq/3.26.0/docs/usage#samplesheet-input)
+  columns `sample,fastq_1,fastq_2,strandedness` (`--strandedness`, default `auto`).
 
 ```bash
-python scripts/geo.py samplesheet GSE110009                        # ENA https URLs
-python scripts/geo.py samplesheet GSE110009 --group-by sample_title
-python scripts/geo.py samplesheet GSE110009 --local-dir ./fastq
+python scripts/geo.py samplesheet GSE110009 --assay scrna              # ENA https URLs
+python scripts/geo.py samplesheet GSE110009 --assay bulk --strandedness reverse
+python scripts/geo.py samplesheet GSE110009 --assay scrna --local-dir ./fastq
 ```
 
 - `--group-by` / `--local-dir` behave as in the `ena` skill.

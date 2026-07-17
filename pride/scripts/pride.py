@@ -16,6 +16,7 @@ Examples:
     python pride.py samplesheet PXD000561                 # minimal-valid <acc>.sdrf.tsv
     python pride.py samplesheet PXD000001 --from generate --acquisition dda
     python pride.py download-script PXD000561 --ext raw --out dl.sh
+    python pride.py metadata-table PXD000561 --out metadata.tsv
 """
 import argparse
 import csv
@@ -440,6 +441,184 @@ def cmd_samplesheet(args):
           file=sys.stderr)
 
 
+# ---- harmonized metadata.tsv (shared shape across skills) ----
+import html
+
+METADATA_COLS = ["sample", "replicate", "species", "sex", "age",
+                 "condition", "genotype", "treatment", "tissue"]
+NA = "NA"
+
+FIELD_KEYS = {
+    "species": ["organism", "scientific_name", "species", "organism scientific name"],
+    "sex": ["sex", "gender"],
+    "age": ["age", "developmental stage", "dev stage", "age at collection", "age at sampling"],
+    "condition": ["disease", "disease state", "condition", "phenotype",
+                  "health state", "clinical information", "diagnosis"],
+    "genotype": ["genotype", "genotype/variation", "variation", "strain",
+                 "strain/background", "background"],
+    "treatment": ["treatment", "agent", "compound", "stimulus",
+                  "perturbation", "dose", "treatment protocol"],
+    "tissue": ["tissue", "organism part", "tissue type", "tissue region", "source tissue"],
+}
+_REPLICATE_KEYS = ("replicate", "biological replicate", "technical replicate",
+                   "replicate number")
+_IDENTITY_KEYS = ("source name", "sample", "sample name", "sample_accession",
+                  "run_accession", "assay name", "name", "title")
+_NULLS = {"", "na", "n/a", "none", "null", "unknown", "not applicable",
+          "not available", "not collected", "not provided", "missing", "--"}
+
+
+def _norm_key(k):
+    k = (k or "").strip().lower()
+    m = re.match(r"(?:characteristics|comment|factor\s*value|factorvalue)\s*\[(.+)\]$", k)
+    return m.group(1).strip() if m else k
+
+
+def _clean_val(v):
+    v = re.sub(r"\s+", " ", html.unescape(v or "").strip())
+    return "" if v.lower() in _NULLS else v
+
+
+def _col_name(k):
+    """Column-safe name for a promoted extra characteristic."""
+    return re.sub(r"[^0-9a-z]+", "_", k.strip().lower()).strip("_") or "field"
+
+
+def _is_attr_col(header):
+    return bool(re.match(r"(?:characteristics|factor\s*value|factorvalue)\s*\[",
+                         header.strip().lower()))
+
+
+def harmonize_row(sample, replicate, attrs):
+    """Map source-native (name -> value) annotations onto the metadata columns.
+
+    Core fields (METADATA_COLS) are always present; missing ones become 'NA'. Every
+    other characteristic is promoted to its own column so nothing is dropped.
+    """
+    norm = {}
+    for k, v in (attrs or {}).items():
+        nk, cv = _norm_key(k), _clean_val(v)
+        if nk and cv and nk not in norm:
+            norm[nk] = cv
+    row = {"sample": _clean_val(sample) or NA,
+           "replicate": _clean_val(replicate) or NA}
+    used = set(_REPLICATE_KEYS) | set(_IDENTITY_KEYS)
+    for field, keys in FIELD_KEYS.items():
+        used.update(keys)  # every synonym is consumed, not just the matched one
+        val = ""
+        for cand in keys:
+            if norm.get(cand):
+                val = norm[cand]
+                break
+        row[field] = val or NA
+    for k, v in norm.items():
+        if k not in used:
+            row.setdefault(_col_name(k), v)
+    return row
+
+
+def write_metadata_tsv(rows, out):
+    """Write rows as TSV; header = core columns + union of any extra columns."""
+    header = list(METADATA_COLS)
+    for r in rows:
+        for k in r:
+            if k not in header:
+                header.append(k)
+    with open(out, "w", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(header)
+        for r in rows:
+            w.writerow([r.get(c, NA) for c in header])
+    return len(rows), len(header)
+
+
+def ebi_biosample_attrs(accession):
+    """Fetch characteristics from the EBI BioSamples API for a BioSample id.
+
+    Returns {} for non-BioSample identifiers (only SAME*/SAMEA*/SAMN*/SAMD*).
+    """
+    if not re.match(r"^SAM[NED]", (accession or "").strip(), re.I):
+        return {}
+    try:
+        data = json.loads(
+            http_get("https://www.ebi.ac.uk/biosamples/samples/" + accession)
+            .decode("utf-8", "replace"))
+    except SystemExit:
+        return {}
+    attrs = {}
+    for name, vals in (data.get("characteristics") or {}).items():
+        if name.strip().lower().startswith(
+                ("ena-", "ena ", "arrayexpress-", "insdc", "external id",
+                 "ncbi submission", "sra accession", "submitter", "submission",
+                 "broker")):
+            continue  # skip archive bookkeeping, keep biological characteristics
+        if isinstance(vals, list) and vals and isinstance(vals[0], dict):
+            text = vals[0].get("text", "")
+            if text:
+                attrs[name] = text
+    return attrs
+
+
+def merge_biosample(sample_id, attrs):
+    """Fill missing/extra fields from EBI BioSamples when sample_id is a BioSample."""
+    bs = ebi_biosample_attrs(sample_id)
+    if not bs:
+        return attrs
+    merged = dict(attrs)
+    for k, v in bs.items():
+        merged.setdefault(k, v)
+    return merged
+
+
+def cmd_metadata_table(args):
+    """Write a harmonized metadata.tsv (one row per sample x replicate).
+
+    Uses the submitter SDRF when present (characteristics[...] / factor value[...]
+    columns, `source name` as sample, technical/biological replicate as replicate);
+    otherwise emits a single project-level row from PRIDE metadata.
+    """
+    try:
+        sdrf_urls = get_json(f"/files/sdrf/{args.accession}")
+    except SystemExit:
+        sdrf_urls = []
+    rows = []
+    if sdrf_urls:
+        text = http_get(_https(sdrf_urls[0])).decode("utf-8", "replace")
+        table = list(csv.reader(io.StringIO(text), delimiter="\t"))
+        if not table:
+            raise SystemExit("Downloaded SDRF is empty.")
+        header = [h.strip() for h in table[0]]
+        for raw in table[1:]:
+            if not any(c.strip() for c in raw):
+                continue
+            cells = {header[i]: (raw[i] if i < len(raw) else "") for i in range(len(header))}
+            sample = next((v for k, v in cells.items() if k.strip().lower() == "source name"), "")
+            replicate = ""
+            for k, v in cells.items():
+                if _norm_key(k) in _REPLICATE_KEYS and v.strip():
+                    replicate = v.strip()
+                    break
+            attrs = {k: v for k, v in cells.items() if _is_attr_col(k)}
+            attrs = merge_biosample(sample, attrs)
+            rows.append(harmonize_row(sample, replicate or "1", attrs))
+        src = "submitter SDRF"
+    else:
+        meta = get_json(f"/projects/{args.accession}")
+        attrs = {}
+        if meta.get("organisms"):
+            attrs["organism"] = re.sub(r"\s*\(.*\)$", "",
+                                       meta["organisms"][0].get("name", "")).strip()
+        if meta.get("diseases"):
+            attrs["disease"] = meta["diseases"][0].get("name", "")
+        if meta.get("instruments"):
+            attrs["instrument"] = ", ".join(_names(meta["instruments"]))
+        rows.append(harmonize_row(args.accession, "1", attrs))
+        src = "project metadata (no SDRF)"
+    n, ncols = write_metadata_tsv(rows, args.out)
+    print(f"Wrote {n} row(s) x {ncols} column(s) for {args.accession} from {src} to {args.out}",
+          file=sys.stderr)
+
+
 def cmd_search(args):
     params = {"keyword": args.query, "pageSize": args.limit, "page": 0}
     res = get_json("/search/projects", params)
@@ -490,6 +669,12 @@ def main():
     ss.add_argument("--acquisition", choices=["dia", "dda"], default="dia",
                     help="value for comment[proteomics data acquisition method] (default dia)")
     ss.set_defaults(func=cmd_samplesheet)
+
+    mt = sub.add_parser("metadata-table",
+                        help="Write a harmonized metadata.tsv (one row per sample x replicate)")
+    mt.add_argument("accession")
+    mt.add_argument("--out", default="metadata.tsv")
+    mt.set_defaults(func=cmd_metadata_table)
 
     ds = sub.add_parser("download-script",
                         help="Generate a bash + SLURM script to download project files (.raw/.zip)")
