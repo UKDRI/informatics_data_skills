@@ -84,6 +84,9 @@ name is the skill `name`; `SKILL.md` frontmatter carries the trigger-rich
   listings are scraped from the Apache HTML index (absolute/footer links filtered).
 - **Honors** `NCBI_EMAIL` / `NCBI_API_KEY` env vars to lift rate limits.
 - **Raw reads are not in GEO** — see the GEO→ENA bridge below.
+- **SRA Run Selector**: `runtable` resolves the linked SRA study and writes
+  `SraRunTable.csv` + `SRR_Acc_List.txt` via `efetch db=sra rettype=runinfo`
+  (with `usehistory` so large studies work).
 
 ### ena (ENA Portal + Browser APIs)
 - **Portal API** `filereport` / `search` / `returnFields` for run/experiment/
