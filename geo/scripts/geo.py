@@ -15,6 +15,7 @@ Examples:
     python geo.py search "breast cancer RNA-seq" --organism "Homo sapiens" --limit 20
     python geo.py metadata-table GSE2553 --out metadata.tsv
     python geo.py runtable GSE110009 --out .          # SraRunTable.csv + SRR_Acc_List.txt
+    python geo.py samplesheet GSE110009 --assay bulk --from-runtable SraRunTable.csv --fastq-dir ./fastq
 """
 import argparse
 import json
@@ -234,6 +235,42 @@ def fastq_pair(urls):
     return "", ""
 
 
+def fastq_names_from_layout(run, layout, fastq_dir):
+    """SRA-Toolkit fastq names for a run: SRR.fastq (single) or SRR_1/_2.fastq (paired)."""
+    paired = (layout or "").strip().upper().startswith("PAIRED")
+    if paired:
+        return (os.path.join(fastq_dir, f"{run}_1.fastq"),
+                os.path.join(fastq_dir, f"{run}_2.fastq"))
+    return os.path.join(fastq_dir, f"{run}.fastq"), ""
+
+
+def rows_from_runtable(path, fastq_dir, group_by):
+    """Build samplesheet rows from a local SraRunTable.csv (E-utilities runinfo CSV).
+
+    fastq columns are SRA-Toolkit filenames keyed by the `Run` accession; single vs
+    paired is read from the `LibraryLayout` column (SINGLE -> SRR.fastq; PAIRED ->
+    SRR_1.fastq/SRR_2.fastq). No network access.
+    """
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        cols = reader.fieldnames or []
+        run_col = "Run" if "Run" in cols else (cols[0] if cols else "Run")
+        layout_col = "LibraryLayout" if "LibraryLayout" in cols else None
+        # --group-by if it names a runtable column, else fall back to a sample-ish column.
+        sample_col = group_by if group_by in cols else next(
+            (c for c in ("SampleName", "Sample", run_col) if c in cols), run_col)
+        rows = []
+        for r in reader:
+            run = (r.get(run_col) or "").strip()
+            if not run:
+                continue
+            layout = r.get(layout_col, "") if layout_col else ""
+            f1, f2 = fastq_names_from_layout(run, layout, fastq_dir)
+            rows.append({"sample": clean_sample(r.get(sample_col) or run),
+                         "fastq_1": f1, "fastq_2": f2})
+    return rows
+
+
 def resolve_sra_project(accession):
     """Find the SRA study / BioProject linked to a GEO accession."""
     url = ("https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc="
@@ -279,6 +316,18 @@ def write_samplesheet(rows, out, assay, strandedness="auto"):
 
 
 def cmd_samplesheet(args):
+    if args.from_runtable:
+        if not args.fastq_dir:
+            raise SystemExit("--from-runtable requires --fastq-dir DIR "
+                             "(samplesheet fastq paths must include a directory).")
+        rows = rows_from_runtable(args.from_runtable, args.fastq_dir, args.group_by)
+        if not rows:
+            raise SystemExit(f"No run rows found in {args.from_runtable}.")
+        n = write_samplesheet(rows, args.out, args.assay, args.strandedness)
+        print(f"Wrote {n} row(s) for {len({r['sample'] for r in rows})} sample(s) to {args.out} "
+              f"(nf-core/{'rnaseq' if args.assay == 'bulk' else 'scrnaseq'}, "
+              f"SRA fastq names from {args.from_runtable})", file=sys.stderr)
+        return
     project = resolve_sra_project(args.accession)
     if not project:
         raise SystemExit(
@@ -603,6 +652,12 @@ def main():
                          "(sample_accession, sample_alias, sample_title, experiment_accession)")
     ss.add_argument("--local-dir",
                     help="write local paths <dir>/<run>/<file> instead of ENA URLs")
+    ss.add_argument("--from-runtable", metavar="PATH",
+                    help="build fastq names offline from a local SraRunTable.csv: "
+                         "SRR.fastq (SINGLE) or SRR_1.fastq/SRR_2.fastq (PAIRED), per the "
+                         "LibraryLayout column. Skips ENA. Requires --fastq-dir.")
+    ss.add_argument("--fastq-dir", metavar="DIR",
+                    help="directory to prefix fastq filenames (required with --from-runtable)")
     ss.set_defaults(func=cmd_samplesheet)
 
     args = p.parse_args()

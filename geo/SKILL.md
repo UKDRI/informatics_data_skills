@@ -63,7 +63,9 @@ python scripts/geo.py runtable GSE110009 --out ./GSE110009
 ```
 
 - `SRR_Acc_List.txt` feeds `prefetch`/`fasterq-dump` (SRA Toolkit); for ENA FASTQ
-  URLs use `samplesheet` or the `ena` skill instead.
+  URLs use `samplesheet` or the `ena` skill instead. To build an nf-core sample sheet
+  whose fastq names match the `fasterq-dump` output, pass the `SraRunTable.csv` to
+  `samplesheet --from-runtable` (see below).
 - If the series has no SRA data (or it is controlled-access), the command reports
   it rather than writing empty files.
 
@@ -108,6 +110,28 @@ python scripts/geo.py samplesheet GSE110009 --assay scrna --local-dir ./fastq
   access), the command reports that clearly — the reads are not downloadable here.
 - Feed the resulting samplesheet to the `fastq-download-script` skill for a
   cluster download script.
+
+### From a runtable (SRA Toolkit fastq names)
+
+When you fetch reads with the SRA Toolkit (`prefetch` + `fasterq-dump` over
+`SRR_Acc_List.txt`) instead of ENA, the local files are named by run accession.
+`--from-runtable` builds the sample sheet **offline** from a local `SraRunTable.csv`
+(from `runtable`) so the fastq columns match those filenames — single vs paired is
+read from the table's `LibraryLayout` column:
+
+- `SINGLE` → `fastq_1 = <dir>/SRRxxxxxxx.fastq`, `fastq_2` empty
+- `PAIRED` → `fastq_1 = <dir>/SRRxxxxxxx_1.fastq`, `fastq_2 = <dir>/SRRxxxxxxx_2.fastq`
+
+`--fastq-dir DIR` is required (it prefixes every fastq path). No ENA request is made.
+In this mode `--group-by` names a runtable column (e.g. `SampleName`, `Sample`,
+`Experiment`); the default falls back to `SampleName` → `Sample` → `Run`.
+
+```bash
+python scripts/geo.py runtable    GSE110009 --out ./GSE110009
+# ... prefetch / fasterq-dump using ./GSE110009/SRR_Acc_List.txt -> ./fastq/ ...
+python scripts/geo.py samplesheet GSE110009 --assay bulk \
+    --from-runtable ./GSE110009/SraRunTable.csv --fastq-dir ./fastq
+```
 
 Download flags: `--matrix` (default), `--soft`, `--miniml`, `--suppl`. Combine as
 needed; files land in `<out>/<ACCESSION>/<subdir>/`.
