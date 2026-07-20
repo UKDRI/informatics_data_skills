@@ -342,14 +342,15 @@ def minimal_defaults(accession, acquisition):
     return d
 
 
-def generate_minimal_rows(accession, files, defaults):
+def generate_minimal_rows(accession, files, defaults, local_dir=None):
     rows = []
     for i, f in enumerate(files, start=1):
         url = ftp_url(f)
+        fname = _fname(f)
         row = dict(defaults)
         row["source name"] = f"Sample {i}"
         row["assay name"] = f"run {i}"
-        row["comment[data file]"] = _fname(f)
+        row["comment[data file]"] = os.path.join(local_dir, fname) if local_dir else fname
         row["comment[file uri]"] = _https(url) if url else ""
         rows.append(row)
     return rows
@@ -363,7 +364,7 @@ def write_minimal_tsv(rows, out):
             w.writerow([r.get(c, "") for c in MINIMAL_SDRF_COLUMNS])
 
 
-def complete_existing_sdrf(text, out, defaults):
+def complete_existing_sdrf(text, out, defaults, local_dir=None):
     """Write the submitter SDRF, appending any missing minimal columns with defaults."""
     rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
     if not rows:
@@ -371,6 +372,8 @@ def complete_existing_sdrf(text, out, defaults):
     header = rows[0]
     present = {_norm_col(c) for c in header}
     missing = [c for c in MINIMAL_SDRF_COLUMNS if _norm_col(c) not in present]
+    df_idx = next((i for i, c in enumerate(header)
+                   if _norm_col(c) == _norm_col("comment[data file]")), None)
     with open(out, "w", newline="") as fh:
         w = csv.writer(fh, delimiter="\t")
         w.writerow(header + missing)
@@ -378,6 +381,9 @@ def complete_existing_sdrf(text, out, defaults):
         for row in rows[1:]:
             if not any(c.strip() for c in row):
                 continue
+            if local_dir and df_idx is not None and df_idx < len(row) and row[df_idx].strip():
+                row = list(row)
+                row[df_idx] = os.path.join(local_dir, os.path.basename(row[df_idx].strip()))
             w.writerow(row + extra)
     return missing
 
@@ -411,7 +417,7 @@ def cmd_samplesheet(args):
 
     if urls and args.source in ("auto", "pride"):
         text = http_get(_https(urls[0])).decode("utf-8", "replace")
-        missing = complete_existing_sdrf(text, out, defaults)
+        missing = complete_existing_sdrf(text, out, defaults, args.local_dir)
         print(f"Wrote PRIDE submitter SDRF -> {out}", file=sys.stderr)
         if missing:
             print(f"Completed {len(missing)} missing minimal column(s) with defaults: "
@@ -427,7 +433,7 @@ def cmd_samplesheet(args):
         if not files:
             raise SystemExit(
                 "No MS data files (.raw/.mzML/.d/.wiff) found; cannot generate a minimal SDRF.")
-        rows = generate_minimal_rows(args.accession, files, defaults)
+        rows = generate_minimal_rows(args.accession, files, defaults, args.local_dir)
         write_minimal_tsv(rows, out)
         print(f"Generated minimal SDRF for {len(rows)} run(s) -> {out}", file=sys.stderr)
 
@@ -668,6 +674,9 @@ def main():
                          "pride: submitter SDRF only; generate: build from data files + metadata")
     ss.add_argument("--acquisition", choices=["dia", "dda"], default="dia",
                     help="value for comment[proteomics data acquisition method] (default dia)")
+    ss.add_argument("--local-dir",
+                    help="write comment[data file] as local paths <dir>/<file> "
+                         "(matching download-script output) instead of bare filenames")
     ss.set_defaults(func=cmd_samplesheet)
 
     mt = sub.add_parser("metadata-table",
