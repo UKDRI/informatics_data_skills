@@ -73,7 +73,13 @@ to `<accession>.sdrf.tsv`; any `--out` you pass has its extension corrected.
 python scripts/pride.py samplesheet PXD000561                       # <acc>.sdrf.tsv
 python scripts/pride.py samplesheet PXD000561 --from pride          # submitter SDRF only
 python scripts/pride.py samplesheet PXD000001 --from generate --acquisition dda
+python scripts/pride.py samplesheet PXD000561 --local-dir ./pride_data  # comment[data file] -> ./pride_data/<file>
 ```
+
+`--local-dir DIR` rewrites the **`comment[data file]`** column to flat local paths
+`<dir>/<file>` (matching the `download-script` output layout) instead of bare
+filenames; `comment[file uri]` is left as the https URL. It applies to both the
+submitter and generated SDRF paths.
 
 Two sources, chosen with `--from` (default `auto`):
 
