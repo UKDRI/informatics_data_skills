@@ -92,8 +92,13 @@ python scripts/ena.py samplesheet PRJEB1787 --assay bulk --local-dir ./ena_out/P
 - `expected_cells` / `seq_center` are optional scrnaseq columns; add them by hand
   if needed. Check that `fastq_1` (barcodes) and `fastq_2` (cDNA) are the right way
   round for your 10x chemistry.
-- Turn the URL samplesheet into a cluster download script with the
-  `fastq-download-script` skill.
+- **Recommended route to FASTQ**: turn the URL samplesheet into a cluster download
+  script with the `fastq-download-script` skill (direct HTTPS download of the ENA
+  FASTQ files). Prefer this for ENA-hosted data.
+- *Alternative*: pull the same runs from NCBI with sra-tools instead — feed a
+  `run_accession` list (`report --result read_run --fields run_accession`) to the
+  `sra` skill. Use only when the ENA download is unsuitable (e.g. runs not mirrored
+  to ENA, or you specifically want the NCBI `prefetch`/`fasterq-dump` path).
 
 ## How access works (for ad-hoc queries)
 
