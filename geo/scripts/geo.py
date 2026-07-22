@@ -29,13 +29,19 @@ EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 FTP_BASE = "https://ftp.ncbi.nlm.nih.gov/geo"
 USER_AGENT = "geo-skill/1.0 (https://www.ncbi.nlm.nih.gov/geo/)"
 
-# NCBI asks for an email + optional api_key to lift rate limits. Set via env.
+# NCBI accepts an optional email + api_key to lift E-utilities rate limits.
+# These are read from the environment but, per the "No unsolicited credentials"
+# rule, are NEVER sent unless the user explicitly opts in with
+# --use-ncbi-credentials — the mere presence of the env vars is not consent.
 NCBI_EMAIL = os.environ.get("NCBI_EMAIL", "")
 NCBI_API_KEY = os.environ.get("NCBI_API_KEY", "")
+_USE_CREDENTIALS = False  # flipped on only by --use-ncbi-credentials
 
 
 def _eutil_params(extra):
     p = dict(extra)
+    if not _USE_CREDENTIALS:
+        return p  # opt-in required; ignore any env-var credentials
     if NCBI_EMAIL:
         p["email"] = NCBI_EMAIL
         p["tool"] = "geo-skill"
@@ -203,8 +209,44 @@ ENA_PORTAL = "https://www.ebi.ac.uk/ena/portal/api"
 SAMPLESHEET_COLS = ["sample", "fastq_1", "fastq_2"]
 
 
+# --- output field hygiene (see DESIGN.md "Clean output fields") ---
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # CR, LF, tab, other control chars
+
+
+def _safe_field(v):
+    """Value safe for one CSV/TSV cell: control chars -> _, runs of spaces collapsed."""
+    return re.sub(r" +", " ", _CTRL_RE.sub("_", v or "")).strip()
+
+
 def clean_sample(name):
-    return re.sub(r"\s+", "_", (name or "").strip())
+    """nf-core sample id: keep the conservative safe set [A-Za-z0-9._-];
+    whitespace and every other character -> _ (see DESIGN.md)."""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "").strip())
+    return s.strip("._-") or "sample"
+
+
+def finalize_sample_ids(rows):
+    """Clean each row's 'sample' in place; warn on rewrite, error on collision.
+
+    A collision (two *distinct* originals normalizing to one id) is fatal: the
+    pipeline concatenates rows sharing a `sample`, so it would silently pool
+    different biological samples.
+    """
+    seen, warned = {}, set()
+    for r in rows:
+        orig = r.get("sample", "") or ""
+        clean = clean_sample(orig)
+        if clean != orig and orig not in warned:
+            print(f"warning: sample {orig!r} -> {clean!r}", file=sys.stderr)
+            warned.add(orig)
+        if clean in seen and seen[clean] != orig:
+            raise SystemExit(
+                f"sample-name collision: {orig!r} and {seen[clean]!r} both normalize "
+                f"to {clean!r}. Rename one or choose a different --group-by so distinct "
+                "samples stay distinct (the pipeline concatenates rows sharing a sample).")
+        seen.setdefault(clean, orig)
+        r["sample"] = clean
+    return rows
 
 
 def to_https(url):
@@ -266,7 +308,8 @@ def rows_from_runtable(path, fastq_dir, group_by):
                 continue
             layout = r.get(layout_col, "") if layout_col else ""
             f1, f2 = fastq_names_from_layout(run, layout, fastq_dir)
-            rows.append({"sample": clean_sample(r.get(sample_col) or run),
+            # raw sample here; finalize_sample_ids cleans + collision-checks later
+            rows.append({"sample": (r.get(sample_col) or run),
                          "fastq_1": f1, "fastq_2": f2})
     return rows
 
@@ -311,7 +354,7 @@ def write_samplesheet(rows, out, assay, strandedness="auto"):
             row = dict(r)
             if assay == "bulk":
                 row["strandedness"] = strandedness
-            w.writerow([row.get(c, "") for c in cols])
+            w.writerow([_safe_field(row.get(c, "")) for c in cols])
     return len(rows)
 
 
@@ -323,6 +366,7 @@ def cmd_samplesheet(args):
         rows = rows_from_runtable(args.from_runtable, args.fastq_dir, args.group_by)
         if not rows:
             raise SystemExit(f"No run rows found in {args.from_runtable}.")
+        finalize_sample_ids(rows)
         n = write_samplesheet(rows, args.out, args.assay, args.strandedness)
         print(f"Wrote {n} row(s) for {len({r['sample'] for r in rows})} sample(s) to {args.out} "
               f"(nf-core/{'rnaseq' if args.assay == 'bulk' else 'scrnaseq'}, "
@@ -348,7 +392,8 @@ def cmd_samplesheet(args):
             f1 = os.path.join(args.local_dir, run, f1.rsplit("/", 1)[-1]) if f1 else ""
             f2 = os.path.join(args.local_dir, run, f2.rsplit("/", 1)[-1]) if f2 else ""
         sample = r.get(args.group_by) or r.get("sample_accession") or r.get("run_accession")
-        rows.append({"sample": clean_sample(sample), "fastq_1": f1, "fastq_2": f2})
+        rows.append({"sample": sample or "", "fastq_1": f1, "fastq_2": f2})
+    finalize_sample_ids(rows)
     n = write_samplesheet(rows, args.out, args.assay, args.strandedness)
     print(f"Wrote {n} row(s) for {len({r['sample'] for r in rows})} sample(s) to {args.out} "
           f"(nf-core/{'rnaseq' if args.assay == 'bulk' else 'scrnaseq'})", file=sys.stderr)
@@ -447,7 +492,7 @@ def _norm_key(k):
 
 
 def _clean_val(v):
-    v = re.sub(r"\s+", " ", html.unescape(v or "").strip())
+    v = re.sub(r" +", " ", _CTRL_RE.sub("_", html.unescape(v or ""))).strip()
     return "" if v.lower() in _NULLS else v
 
 
@@ -593,22 +638,29 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    m = sub.add_parser("metadata", help="Series/dataset summary via E-utilities")
+    # Shared opt-in: send NCBI credentials only when the user explicitly asks.
+    cred = argparse.ArgumentParser(add_help=False)
+    cred.add_argument("--use-ncbi-credentials", action="store_true",
+                      help="opt in to send NCBI_EMAIL / NCBI_API_KEY (read from the "
+                           "environment) with E-utilities requests to lift NCBI rate "
+                           "limits; OFF by default even when those env vars are set")
+
+    m = sub.add_parser("metadata", parents=[cred], help="Series/dataset summary via E-utilities")
     m.add_argument("accession")
     m.add_argument("--json", action="store_true")
     m.set_defaults(func=cmd_metadata)
 
-    s = sub.add_parser("samples", help="List samples (GSMs) in a series")
+    s = sub.add_parser("samples", parents=[cred], help="List samples (GSMs) in a series")
     s.add_argument("accession")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_samples)
 
-    f = sub.add_parser("files", help="List downloadable files on GEO FTP")
+    f = sub.add_parser("files", parents=[cred], help="List downloadable files on GEO FTP")
     f.add_argument("accession")
     f.add_argument("--json", action="store_true")
     f.set_defaults(func=cmd_files)
 
-    d = sub.add_parser("download", help="Download files from GEO FTP")
+    d = sub.add_parser("download", parents=[cred], help="Download files from GEO FTP")
     d.add_argument("accession")
     d.add_argument("--out", default="./geo_out")
     d.add_argument("--matrix", action="store_true", help="series matrix (default)")
@@ -617,7 +669,7 @@ def main():
     d.add_argument("--suppl", action="store_true", help="supplementary/raw files")
     d.set_defaults(func=cmd_download)
 
-    q = sub.add_parser("search", help="Free-text search of GEO DataSets")
+    q = sub.add_parser("search", parents=[cred], help="Free-text search of GEO DataSets")
     q.add_argument("query")
     q.add_argument("--organism", help='e.g. "Homo sapiens"')
     q.add_argument("--type", help="entry type filter, e.g. gse, gds")
@@ -625,19 +677,19 @@ def main():
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_search)
 
-    mt = sub.add_parser("metadata-table",
+    mt = sub.add_parser("metadata-table", parents=[cred],
                         help="Write a harmonized metadata.tsv (one row per sample/GSM)")
     mt.add_argument("accession", help="GSE accession")
     mt.add_argument("--out", default="metadata.tsv")
     mt.set_defaults(func=cmd_metadata_table)
 
-    rt = sub.add_parser("runtable",
+    rt = sub.add_parser("runtable", parents=[cred],
                         help="Download SRA Run Selector files (SraRunTable.csv + SRR_Acc_List.txt)")
     rt.add_argument("accession", help="GSE (or GSM) accession")
     rt.add_argument("--out", default=".", help="output directory (default current dir)")
     rt.set_defaults(func=cmd_runtable)
 
-    ss = sub.add_parser("samplesheet",
+    ss = sub.add_parser("samplesheet", parents=[cred],
                         help="Build an nf-core samplesheet.csv via the linked SRA/ENA data (--assay scrna|bulk)")
     ss.add_argument("accession", help="GSE (or GSM) accession")
     ss.add_argument("--assay", choices=["scrna", "bulk"], required=True,
@@ -661,6 +713,9 @@ def main():
     ss.set_defaults(func=cmd_samplesheet)
 
     args = p.parse_args()
+    if getattr(args, "use_ncbi_credentials", False):
+        global _USE_CREDENTIALS
+        _USE_CREDENTIALS = True
     args.func(args)
 
 

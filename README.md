@@ -93,7 +93,7 @@ python geo/scripts/geo.py search "breast cancer RNA-seq" --organism "Homo sapien
 python geo/scripts/geo.py samplesheet GSE110009 --out samplesheet.csv
 ```
 
-Raw reads are **not** in GEO — `samplesheet` resolves the linked SRA/BioProject and pulls FASTQ links from ENA. Set `NCBI_EMAIL` / `NCBI_API_KEY` to lift rate limits.
+Raw reads are **not** in GEO — `samplesheet` resolves the linked SRA/BioProject and pulls FASTQ links from ENA. To lift rate limits, set `NCBI_EMAIL` / `NCBI_API_KEY` **and** pass `--use-ncbi-credentials` (opt-in; the env vars are ignored otherwise).
 </details>
 
 <details>

@@ -216,8 +216,17 @@ def _https(url):
     return url.replace("ftp://", "https://") if url.startswith("ftp://") else url
 
 
+# --- output field hygiene (see DESIGN.md "Clean output fields") ---
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # CR, LF, tab, other control chars
+
+
+def _safe_field(v):
+    """Value safe for one line/cell: control chars -> _, runs of spaces collapsed."""
+    return re.sub(r" +", " ", _CTRL_RE.sub("_", v or "")).strip()
+
+
 def _dl_cmd(tool, url, outdir):
-    name = url.rstrip("/").split("/")[-1]
+    name = _safe_field(url.rstrip("/").split("/")[-1])
     dest = f'"{outdir}/{name}"'
     if tool == "curl":
         # -f fail on HTTP errors, -s silent (no progress bar), -S show errors,
@@ -266,8 +275,12 @@ def cmd_download_script(args):
         url = ftp_url(f)
         if not url:
             continue
+        url = _https(url)
+        if _CTRL_RE.search(url) or '"' in url:  # never embed an unsafe URL in the shell
+            print(f"warning: skipping file with an unsafe URL: {url!r}", file=sys.stderr)
+            continue
         cat = (f.get("fileCategory") or {}).get("value", "")
-        entries.append((_fname(f), _https(url), cat))
+        entries.append((_safe_field(_fname(f)), url, _safe_field(cat)))
     if not entries:
         raise SystemExit("No matching files for this project (check --ext).")
 
@@ -361,7 +374,7 @@ def write_minimal_tsv(rows, out):
         w = csv.writer(fh, delimiter="\t")
         w.writerow(MINIMAL_SDRF_COLUMNS)
         for r in rows:
-            w.writerow([r.get(c, "") for c in MINIMAL_SDRF_COLUMNS])
+            w.writerow([_safe_field(r.get(c, "")) for c in MINIMAL_SDRF_COLUMNS])
 
 
 def complete_existing_sdrf(text, out, defaults, local_dir=None):
@@ -376,7 +389,7 @@ def complete_existing_sdrf(text, out, defaults, local_dir=None):
                    if _norm_col(c) == _norm_col("comment[data file]")), None)
     with open(out, "w", newline="") as fh:
         w = csv.writer(fh, delimiter="\t")
-        w.writerow(header + missing)
+        w.writerow([_safe_field(c) for c in header + missing])
         extra = [defaults.get(c, "not available") for c in missing]
         for row in rows[1:]:
             if not any(c.strip() for c in row):
@@ -384,7 +397,7 @@ def complete_existing_sdrf(text, out, defaults, local_dir=None):
             if local_dir and df_idx is not None and df_idx < len(row) and row[df_idx].strip():
                 row = list(row)
                 row[df_idx] = os.path.join(local_dir, os.path.basename(row[df_idx].strip()))
-            w.writerow(row + extra)
+            w.writerow([_safe_field(c) for c in row + extra])
     return missing
 
 
@@ -481,7 +494,7 @@ def _norm_key(k):
 
 
 def _clean_val(v):
-    v = re.sub(r"\s+", " ", html.unescape(v or "").strip())
+    v = re.sub(r" +", " ", _CTRL_RE.sub("_", html.unescape(v or ""))).strip()
     return "" if v.lower() in _NULLS else v
 
 
