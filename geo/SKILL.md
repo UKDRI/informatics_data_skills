@@ -138,12 +138,18 @@ needed; files land in `<out>/<ACCESSION>/<subdir>/`.
 
 ## Rate limits & auth
 
-NCBI allows 3 requests/sec anonymously, 10/sec with an API key. Set env vars to
-be a good citizen and lift limits:
+NCBI allows 3 requests/sec anonymously, 10/sec with an API key. All commands work
+anonymously and **send no credentials by default**.
+
+Credentials are **opt-in only**: even if `NCBI_EMAIL` / `NCBI_API_KEY` are set in
+the environment, they are ignored unless you pass `--use-ncbi-credentials` on the
+command — presence of the env vars is not consent (see the *No unsolicited
+credentials* rule in `DESIGN.md`). Only supply them when you explicitly want to.
 
 ```bash
 export NCBI_EMAIL="you@example.org"
-export NCBI_API_KEY="..."   # optional, from NCBI account settings
+export NCBI_API_KEY="..."          # optional, from NCBI account settings
+python scripts/geo.py search "asthma" --use-ncbi-credentials   # opt in to send them
 ```
 
 ## How access works (for ad-hoc queries)

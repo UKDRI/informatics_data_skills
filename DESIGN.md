@@ -85,6 +85,36 @@ of truth; the generator fills their `__TOKEN__` placeholders (see below).
   chunks to a `.part` file then atomically rename, and skip files that already exist.
 - **Clear failure**: controlled-access / missing-data / no-SDRF cases raise a
   `SystemExit` with an actionable message rather than producing an empty file.
+- **No unsolicited credentials.** Never put an email address or any other user
+  credential (API key, token, password) into a request or a generated file unless
+  the **user explicitly asks for it in their prompt**. This is stricter than "only
+  when mandatory": the credential's mere availability is **not** consent — even
+  when it sits in the environment (`NCBI_EMAIL`, `NCBI_API_KEY`, …) or in a flag
+  default, do not read, send, or embed it unless the user has explicitly told you
+  to include it. No API used here requires one: the NCBI `email`/`api_key` only
+  lift `geo`'s rate limit, and the SLURM `--email` (`fastq-download-script`,
+  `pride`) is just a `--mail-user` notification address. When the user has not
+  asked, omit the field entirely — never hardcode, default, infer, or
+  opportunistically pull a credential from the environment.
+- **Clean output fields.** Every value written into a generated file —
+  `metadata.tsv`, `samplesheet.csv`, the PRIDE `.sdrf.tsv`, and the generated
+  bash/SLURM download & job scripts — must be reduced to a single safe token: CR
+  (`\r`), LF (`\n`), other control characters, and any literal **tab inside a
+  value** are replaced with `_`, so no value can span lines, break a CSV/TSV row,
+  or escape a shell comment / quoted argument. Ordinary spaces in free-text fields
+  are preserved. A **tab is allowed only as the field separator** in the
+  tab-delimited outputs (`metadata.tsv`, `.sdrf.tsv`) — never within a value. The
+  nf-core `sample` column is normalized to a conservative filename/CLI-safe set
+  (`[A-Za-z0-9._-]`): whitespace and unsafe/control characters → `_`, while the safe
+  and meaningful `.` and `-` are kept — because it becomes file paths and pipeline
+  rule names. Deliberately *not* stricter (`.`/`-` stripped would be overkill and
+  would mangle real IDs). The generator warns when it rewrites a sample name, and —
+  more importantly — **errors when two distinct inputs collapse to the same
+  `sample`**, since nf-core concatenates rows sharing a `sample` value and would
+  otherwise silently pool different biological samples. Every skill implements this
+  at each field-write site — a duplicated `_safe_field` helper (control chars → `_`)
+  and `_clean_val`, `clean_sample`/`finalize_sample_ids` for the `sample` column —
+  on top of the structural quoting `csv.writer` gives the CSV/TSV outputs.
 - **Two ways to emit a SLURM script.** Most generators **string-build** the script
   (and its `#SBATCH` header) in Python from generic, commented-placeholder defaults
   (`fastq-download-script`, the `pride` download script). Where the script carries
@@ -102,7 +132,10 @@ of truth; the generator fills their `__TOKEN__` placeholders (see below).
 - **Files/download**: GEO FTP tree. The bucket path masks the last three digits
   (`GSE2553` → `series/GSE2nnn/GSE2553/{matrix,soft,miniml,suppl}/`). Directory
   listings are scraped from the Apache HTML index (absolute/footer links filtered).
-- **Honors** `NCBI_EMAIL` / `NCBI_API_KEY` env vars to lift rate limits.
+- **Optional NCBI `email`/`api_key`** can lift rate limits, but per *No unsolicited
+  credentials* they are sent **only when the user passes `--use-ncbi-credentials`**.
+  The env vars `NCBI_EMAIL` / `NCBI_API_KEY` are read but ignored without that flag —
+  their presence alone is never treated as consent.
 - **Raw reads are not in GEO** — see the GEO→ENA bridge below.
 - **SRA Run Selector**: `runtable` resolves the linked SRA study and writes
   `SraRunTable.csv` + `SRR_Acc_List.txt` via `efetch db=sra rettype=runinfo`
@@ -174,7 +207,8 @@ the same underlying records.
   three samples in duplicate produces six rows.
 - **Tab-delimited**, `.tsv` extension, with a header row. Chosen over CSV because
   free-text annotation fields (condition, treatment, additional information)
-  routinely contain commas.
+  routinely contain commas. Field values are cleaned per **Clean output fields**
+  above; the separator tab is the only tab.
 - **Core columns, always present, in this order:**
 
   | Column | Meaning |
@@ -242,6 +276,12 @@ One row per run; rows sharing a `sample` value are concatenated by the pipeline.
   (`_I1`, `_R3`, `_3`) are dropped; falls back to positional order.
 - **`--group-by`** chooses which field becomes `sample` (default `sample_accession`).
 - **`--local-dir`** emits local paths matching the `download` layout instead of URLs.
+- **Field hygiene**: the `sample` value must be normalized to a conservative
+  filename/CLI-safe set (`[A-Za-z0-9._-]`; whitespace and unsafe/control chars →
+  `_`, keeping `.`/`-`), warning on rewrite and **erroring on a collision** (two
+  distinct inputs → one `sample`, which the pipeline would silently concatenate).
+  Every other field is cleaned per **Clean output fields** above — for the nf-core
+  sheets and the PRIDE `.sdrf.tsv` alike.
 
 Each source feeds the same builder differently:
 
@@ -273,7 +313,10 @@ warns which values are guesses and need review.
 
 Two of the generators are **transfer-script** generators: they emit bash scripts
 with a **SLURM header** and **quiet** transfers (no progress bars),
-`curl -fsSL --retry 3` or `wget -q --tries=3`.
+`curl -fsSL --retry 3` or `wget -q --tries=3`. Any value embedded in the script —
+the `# sample:` / `# <category>:` comments and file names — must be cleaned per
+**Clean output fields** above so that a newline in a free-text value cannot escape a
+comment or quoted argument into an executable line.
 
 - **`fastq-download-script`** — from a sample sheet's `fastq_*` URL columns (or a
   URL list). One command per file, grouped by `# sample:`. `--tool`, `--outdir`,
@@ -337,7 +380,8 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
 9. **Generate, don't submit; document serialization** — `sra` writes the two
    scripts and prints the `sbatch --dependency=afterok` command, but never runs
    `sbatch`. The prefetch→fasterq-dump ordering is enforced by the user (or that
-   dependency), keeping the generator side-effect-free like every other skill.
+   dependency); the tool only writes the scripts and never runs them, like the
+   other script generators.
 
 ## Verified endpoint reference
 
@@ -376,3 +420,8 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
   UKDRI bind mounts (`/nfsdata,/data,/shared`); `--docker` pulls the image on first
   exec (pre-pull to a `.sif` for many accessions); controlled-access/dbGaP runs need
   NGC credentials that the generated scripts do not set up.
+- **Output field hygiene** is a *cleaning* rule (offending characters replaced with
+  `_`), not escape-encoding — a value containing a newline is made safe but not
+  round-trippable, so a cleaned field cannot be mapped back to its original bytes.
+  Download-script generators additionally **skip** (with a warning) any URL that
+  contains a control character or a `"`, rather than emit it into the shell.

@@ -73,9 +73,44 @@ import re
 SAMPLESHEET_COLS = ["sample", "fastq_1", "fastq_2"]
 
 
+# --- output field hygiene (see DESIGN.md "Clean output fields") ---
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # CR, LF, tab, other control chars
+
+
+def _safe_field(v):
+    """Value safe for one CSV/TSV cell: control chars -> _, runs of spaces collapsed."""
+    return re.sub(r" +", " ", _CTRL_RE.sub("_", v or "")).strip()
+
+
 def clean_sample(name):
-    """nf-core converts whitespace in sample names to underscores."""
-    return re.sub(r"\s+", "_", (name or "").strip())
+    """nf-core sample id: keep the conservative safe set [A-Za-z0-9._-];
+    whitespace and every other character -> _ (see DESIGN.md)."""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "").strip())
+    return s.strip("._-") or "sample"
+
+
+def finalize_sample_ids(rows):
+    """Clean each row's 'sample' in place; warn on rewrite, error on collision.
+
+    A collision (two *distinct* originals normalizing to one id) is fatal: the
+    pipeline concatenates rows sharing a `sample`, so it would silently pool
+    different biological samples.
+    """
+    seen, warned = {}, set()
+    for r in rows:
+        orig = r.get("sample", "") or ""
+        clean = clean_sample(orig)
+        if clean != orig and orig not in warned:
+            print(f"warning: sample {orig!r} -> {clean!r}", file=sys.stderr)
+            warned.add(orig)
+        if clean in seen and seen[clean] != orig:
+            raise SystemExit(
+                f"sample-name collision: {orig!r} and {seen[clean]!r} both normalize "
+                f"to {clean!r}. Rename one or choose a different --group-by so distinct "
+                "samples stay distinct (the pipeline concatenates rows sharing a sample).")
+        seen.setdefault(clean, orig)
+        r["sample"] = clean
+    return rows
 
 
 def to_https(url):
@@ -135,7 +170,7 @@ def write_samplesheet(rows, out, assay, strandedness="auto"):
             row = dict(r)
             if assay == "bulk":
                 row["strandedness"] = strandedness
-            w.writerow([row.get(c, "") for c in cols])
+            w.writerow([_safe_field(row.get(c, "")) for c in cols])
     return len(rows)
 
 
@@ -150,7 +185,8 @@ def rows_from_ena_runs(runs, group_by="sample_accession", local_dir=None):
             f1 = os.path.join(local_dir, run, f1.rsplit("/", 1)[-1]) if f1 else ""
             f2 = os.path.join(local_dir, run, f2.rsplit("/", 1)[-1]) if f2 else ""
         sample = r.get(group_by) or r.get("sample_accession") or r.get("run_accession")
-        rows.append({"sample": clean_sample(sample), "fastq_1": f1, "fastq_2": f2})
+        # keep the raw sample here; finalize_sample_ids cleans + collision-checks later
+        rows.append({"sample": sample or "", "fastq_1": f1, "fastq_2": f2})
     return rows
 
 
@@ -191,7 +227,8 @@ def _norm_key(k):
 
 
 def _clean_val(v):
-    v = re.sub(r"\s+", " ", html.unescape(v or "").strip())
+    # control chars (incl. CR/LF/tab) -> _, collapse spaces; keep ordinary text
+    v = re.sub(r" +", " ", _CTRL_RE.sub("_", html.unescape(v or ""))).strip()
     return "" if v.lower() in _NULLS else v
 
 
@@ -311,6 +348,7 @@ def cmd_samplesheet(args):
             f"No public FASTQ runs found in ENA for {args.accession}. "
             "The data may be under controlled access or not mirrored to ENA.")
     rows = rows_from_ena_runs(runs, group_by=args.group_by, local_dir=args.local_dir)
+    finalize_sample_ids(rows)
     n = write_samplesheet(rows, args.out, args.assay, args.strandedness)
     print(f"Wrote {n} row(s) for {len({r['sample'] for r in rows})} sample(s) to {args.out} "
           f"(nf-core/{'rnaseq' if args.assay == 'bulk' else 'scrnaseq'})", file=sys.stderr)

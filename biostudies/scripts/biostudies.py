@@ -176,8 +176,12 @@ def _norm_key(k):
     return m.group(1).strip() if m else k
 
 
+# control chars (incl. CR/LF/tab) -> _, per DESIGN.md "Clean output fields"
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
 def _clean_val(v):
-    v = re.sub(r"\s+", " ", html.unescape(v or "").strip())
+    v = re.sub(r" +", " ", _CTRL_RE.sub("_", html.unescape(v or ""))).strip()
     return "" if v.lower() in _NULLS else v
 
 

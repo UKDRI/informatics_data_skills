@@ -16,7 +16,16 @@ Examples:
 """
 import argparse
 import csv
+import re
 import sys
+
+# --- output field hygiene (see DESIGN.md "Clean output fields") ---
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # CR, LF, tab, other control chars
+
+
+def _safe_field(v):
+    """Value safe for one line/cell: control chars -> _, runs of spaces collapsed."""
+    return re.sub(r" +", " ", _CTRL_RE.sub("_", v or "")).strip()
 
 
 def urls_from_samplesheet(path):
@@ -37,6 +46,9 @@ def urls_from_samplesheet(path):
             for c in fastq_cols:
                 v = (row.get(c) or "").strip()
                 if v and (v.startswith("http") or v.startswith("ftp")):
+                    if _CTRL_RE.search(v) or '"' in v:
+                        print(f"warning: skipping unsafe URL in {c}: {v!r}", file=sys.stderr)
+                        continue
                     urls.append(v)
                 elif v:
                     print(f"warning: skipping non-URL value in {c}: {v}", file=sys.stderr)
@@ -51,12 +63,15 @@ def urls_from_list(path):
         for i, line in enumerate(fh):
             u = line.strip()
             if u and not u.startswith("#") and (u.startswith("http") or u.startswith("ftp")):
+                if _CTRL_RE.search(u) or '"' in u:
+                    print(f"warning: skipping unsafe URL: {u!r}", file=sys.stderr)
+                    continue
                 out.append((f"file{i + 1}", [u]))
     return out
 
 
 def download_cmd(tool, url, outdir):
-    name = url.rstrip("/").split("/")[-1]
+    name = _safe_field(url.rstrip("/").split("/")[-1])
     dest = f'"{outdir}/{name}"'
     if tool == "curl":
         # -f fail on HTTP errors, -s silent (no progress bar), -S show errors,
@@ -107,7 +122,7 @@ def build_script(groups, args):
     parts.append("")
     n_files = 0
     for sample, urls in groups:
-        parts.append(f"# sample: {sample}")
+        parts.append(f"# sample: {_safe_field(sample)}")
         for u in urls:
             parts.append(download_cmd(args.tool, u, "$OUTDIR"))
             n_files += 1
