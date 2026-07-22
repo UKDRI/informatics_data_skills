@@ -11,8 +11,8 @@ Give an agent (or a human at the CLI) one consistent, dependency-free way to:
 1. **Search** each repository and **fetch metadata** for an accession.
 2. **List** and **download** the associated data files.
 3. Produce **pipeline inputs** — a harmonized `metadata.tsv` sample table,
-   nf-core/scrnaseq or nf-core/rnaseq sample sheets, quantms/DIA-NN minimal SDRFs, and SLURM-ready
-   bash download scripts.
+   nf-core/scrnaseq or nf-core/rnaseq sample sheets, quantms/DIA-NN minimal SDRFs,
+   SLURM-ready bash download scripts, and SRA-tools two-step SLURM job scripts.
 
 Data sources covered:
 
@@ -24,6 +24,7 @@ Data sources covered:
 | `arrayexpress` | ArrayExpress (functional genomics) | EMBL-EBI (in BioStudies) |
 | `biostudies` | BioStudies | EMBL-EBI |
 | `fastq-download-script` | (generator, no external API) | — |
+| `sra` | NCBI SRA, via sra-tools (generator, no external API) | — |
 
 ## Repository layout
 
@@ -45,14 +46,25 @@ data_skills/
 ├── biostudies/
 │   ├── SKILL.md
 │   └── scripts/biostudies.py
-└── fastq-download-script/
+├── fastq-download-script/
+│   ├── SKILL.md
+│   └── scripts/make_download_script.py
+└── sra/
     ├── SKILL.md
-    └── scripts/make_download_script.py
+    ├── scripts/sra.py
+    └── templates/                # cluster-specific job-script boilerplate
+        ├── run_prefetch.sh
+        └── run_fasterq-dump.sh
 ```
 
 One skill = one directory = one data source (or one generator). The directory
 name is the skill `name`; `SKILL.md` frontmatter carries the trigger-rich
 `description` used for skill selection.
+
+`sra` is the first skill with a **`templates/`** folder: it holds literal,
+ready-to-edit SLURM job scripts carrying the UKDRI cluster specifics (partition,
+the sra-tools apptainer image, bind mounts, the `pigz` loop). They are the source
+of truth; the generator fills their `__TOKEN__` placeholders (see below).
 
 ## Conventions (apply to every skill)
 
@@ -73,6 +85,14 @@ name is the skill `name`; `SKILL.md` frontmatter carries the trigger-rich
   chunks to a `.part` file then atomically rename, and skip files that already exist.
 - **Clear failure**: controlled-access / missing-data / no-SDRF cases raise a
   `SystemExit` with an actionable message rather than producing an empty file.
+- **Two ways to emit a SLURM script.** Most generators **string-build** the script
+  (and its `#SBATCH` header) in Python from generic, commented-placeholder defaults
+  (`fastq-download-script`, the `pride` download script). Where the script carries
+  heavy **cluster-specific boilerplate** — apptainer `exec`, `.sif` image, bind
+  mounts, a `pigz` loop — it instead lives as an editable file under the skill's
+  `templates/` folder, and the generator does plain `__TOKEN__` substitution (`sra`).
+  The template variant keeps the boilerplate readable and hand-editable; unflagged
+  output is byte-identical to the committed template apart from the filled tokens.
 
 ## Per-skill design
 
@@ -118,6 +138,27 @@ name is the skill `name`; `SKILL.md` frontmatter carries the trigger-rich
 - Pure transform: reads an nf-core/scrnaseq or /rnaseq sample sheet (it keys off
   the `fastq_*` columns, so the extra `strandedness` column is ignored) or a plain
   URL list, and emits a bash script. No network calls.
+
+### sra (generator, template-backed)
+- The **NCBI SRA route** to FASTQ, complementary to the ENA hub: for runs not
+  mirrored to ENA, or when pulling directly from NCBI via sra-tools.
+- **Two sequential steps.** `run_prefetch.sh` downloads each SRR accession into
+  `.sra` files; `run_fasterq-dump.sh` extracts those to FASTQ and `pigz`-compresses
+  them. The prefetch output dir is wired to be the fasterq-dump input dir. The two
+  must run in order; the generator only writes them and **never submits** — it
+  prints the `sbatch --parsable` / `--dependency=afterok` serialization command.
+- **Input** is a one-accession-per-line list — either an exact file path or a
+  directory containing `SRR_Acc_List.txt`. Upstream skills own list creation:
+  `geo runtable` writes `SRR_Acc_List.txt` directly; from `ena`, take the
+  `run_accession` column of a `report`/`filereport` into a one-per-line list.
+- For **ENA-hosted** runs this skill is the *alternative*, not the default — the
+  recommended route is the direct FASTQ download script (`ena samplesheet` →
+  `fastq-download-script`). Use `sra` when runs are not mirrored to ENA, or when the
+  NCBI `prefetch`/`fasterq-dump` path is specifically wanted.
+- **Image** defaults to the UKDRI `.sif`; `--sif PATH` overrides, or `--docker
+  IMAGE` sets `sif=docker://IMAGE` so apptainer pulls it. The `apptainer exec` line
+  is identical either way (apptainer accepts a `docker://` URI).
+- Runs `scripts/sra.py job-scripts`, filling `templates/run_{prefetch,fasterq-dump}.sh`.
 
 ## Cross-cutting feature: harmonized metadata table
 
@@ -230,8 +271,9 @@ warns which values are guesses and need review.
 
 ## Cross-cutting feature: download scripts
 
-Two generators emit bash scripts with a **SLURM header** and **quiet** transfers
-(no progress bars): `curl -fsSL --retry 3` or `wget -q --tries=3`.
+Two of the generators are **transfer-script** generators: they emit bash scripts
+with a **SLURM header** and **quiet** transfers (no progress bars),
+`curl -fsSL --retry 3` or `wget -q --tries=3`.
 
 - **`fastq-download-script`** — from a sample sheet's `fastq_*` URL columns (or a
   URL list). One command per file, grouped by `# sample:`. `--tool`, `--outdir`,
@@ -241,11 +283,22 @@ Two generators emit bash scripts with a **SLURM header** and **quiet** transfers
   `--ext` filters by extension; `--unzip` appends `unzip` steps for `.zip`
   archives (e.g. Bruker `.d` directories). Same SLURM/tool options.
 
-Typical pipeline:
+A third generator, **`sra`**, is a complementary FASTQ route rather than a transfer
+script: instead of curl/wget over ENA URLs, it emits a two-step **sra-tools compute
+job** (`prefetch` → `fasterq-dump`, run via apptainer) from an `SRR_Acc_List.txt`.
+Use it for runs not mirrored to ENA or when pulling directly from NCBI. It is
+template-backed (see `sra` above) and never submits.
+
+Typical pipelines:
 
 ```
+# ENA FASTQ — recommended default route (direct HTTPS download)
 ena samplesheet PRJEB1787 ─► samplesheet.csv
 fastq-download-script samplesheet.csv --tool curl ─► download_fastq.sh ─► sbatch
+
+# NCBI SRA route — default for SRA-only data (e.g. via GEO), and the ENA alternative
+geo runtable GSE110009 ─► SRR_Acc_List.txt
+sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq-dump.sh ─► sbatch (in order)
 ```
 
 ## Key design decisions
@@ -257,7 +310,11 @@ fastq-download-script samplesheet.csv --tool curl ─► download_fastq.sh ─�
 3. **ENA as the FASTQ hub** — GEO and ArrayExpress do not host raw reads, so both
    resolve to ENA. GEO uses the lightweight SOFT text endpoint
    (`acc.cgi?...&form=text&view=brief`) to find the linked BioProject/SRA rather
-   than downloading the (large) series matrix.
+   than downloading the (large) series matrix. For ENA-hosted data the recommended
+   default is the FASTQ download script (`ena samplesheet` → `fastq-download-script`,
+   direct HTTPS). The `sra` skill is the deliberate **alternative route**: for runs
+   not mirrored to ENA, or when pulling straight from NCBI, it goes via sra-tools
+   (`prefetch`/`fasterq-dump`) instead of ENA URLs.
 4. **One harmonized metadata schema across all sources** — repositories name the
    same biological facts differently; mapping them to a shared core column set
    (with `NA` for absent fields) while promoting any further characteristic to its
@@ -273,6 +330,14 @@ fastq-download-script samplesheet.csv --tool curl ─► download_fastq.sh ─�
 7. **Endpoints verified live** — the API shapes were confirmed against the running
    services (PRIDE v3 paths, ENA field lists, BioStudies file tree) rather than
    assumed from memory, because these APIs drift.
+8. **Template-backed generation for cluster-specific tooling** — the `sra` job
+   scripts carry UKDRI specifics (apptainer image, bind mounts, `pigz` loop) that
+   read far better as an editable job script than as Python string fragments, so
+   they live under `templates/` and the generator only substitutes tokens.
+9. **Generate, don't submit; document serialization** — `sra` writes the two
+   scripts and prints the `sbatch --dependency=afterok` command, but never runs
+   `sbatch`. The prefetch→fasterq-dump ordering is enforced by the user (or that
+   dependency), keeping the generator side-effect-free like every other skill.
 
 ## Verified endpoint reference
 
@@ -292,6 +357,9 @@ fastq-download-script samplesheet.csv --tool curl ─► download_fastq.sh ─�
 3. If it produces sequencing FASTQ, emit the nf-core/scrnaseq columns so the
    `fastq-download-script` skill can consume it.
 4. Verify each subcommand against a live accession before documenting it.
+5. If it emits a cluster script that is mostly fixed boilerplate, keep that script
+   in a `templates/` folder with `__TOKEN__` placeholders and fill it by
+   substitution (see `sra`) rather than string-building it in Python.
 
 ## Known limitations
 
@@ -304,3 +372,7 @@ fastq-download-script samplesheet.csv --tool curl ─► download_fastq.sh ─�
   and 10x barcode/cDNA orientation should be confirmed for the chemistry.
 - **Large studies** download sequentially; for scale, prefer ENA Aspera links or a
   SLURM job array over the generated per-file script.
+- **`sra` job scripts** assume the compute node has `apptainer` and `pigz` and the
+  UKDRI bind mounts (`/nfsdata,/data,/shared`); `--docker` pulls the image on first
+  exec (pre-pull to a `.sif` for many accessions); controlled-access/dbGaP runs need
+  NGC credentials that the generated scripts do not set up.
