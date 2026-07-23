@@ -1,12 +1,13 @@
 # Informatics Data Skills
 
-A collection of [Claude Code](https://docs.claude.com/en/docs/claude-code) **Agent Skills** for obtaining metadata and data from public life-science data repositories — plus helpers that turn what they find into pipeline-ready sample sheets and cluster download scripts.
+A collection of [Claude Code](https://docs.claude.com/en/docs/claude-code) **Agent Skills** for obtaining metadata and data from public life-science data repositories — plus helpers that turn what they find into pipeline-ready sample sheets, cluster download scripts, and a data-portal submission workbook.
 
 Each skill gives an agent (or a human at the CLI) one consistent way to:
 
 1. **Search** a repository and **fetch metadata** for an accession.
 2. **List** and **download** the associated data files.
 3. Produce **pipeline inputs** — a harmonized metadata table, nf-core sample sheets, quantms/DIA-NN minimal SDRFs, and cluster-ready download / job scripts.
+4. Produce a **submission workbook** — fill the UK DRI FAIR-metadata Excel template for the ADDI / AD Workbench data portal.
 
 ## Skills
 
@@ -19,6 +20,7 @@ Each skill gives an agent (or a human at the CLI) one consistent way to:
 | [`biostudies`](biostudies/) | BioStudies | EMBL-EBI |
 | [`fastq-download-script`](fastq-download-script/) | FASTQ download-script generator | — |
 | [`sra`](sra/) | NCBI SRA download job-script generator (sra-tools) | — |
+| [`addi`](addi/) | ADDI / AD Workbench FAIR-metadata submission workbook | — |
 
 One skill = one directory = one data source (or one generator).
 
@@ -31,6 +33,7 @@ One skill = one directory = one data source (or one generator).
 - **`biostudies`** — Fetch study metadata, list and download attached files, and search across BioStudies collections (ArrayExpress, BioImage Archive, and standalone submissions).
 - **`fastq-download-script`** — Turn a sample sheet (or a plain URL list) into a cluster-ready bash download script with a SLURM header.
 - **`sra`** — Turn an accession list into the two sequential SLURM job scripts (`prefetch` → `fasterq-dump`) that download SRR accessions from NCBI SRA and extract them to gzipped FASTQ — the route for runs not mirrored to ENA.
+- **`addi`** — Fill the UK DRI FAIR-metadata Excel template for an ADDI / AD Workbench submission: describe the study (catalogue) and its data tables (dictionaries/fields/lookups), validate against the template's controlled vocabularies and rules, and write a filled `.xlsx` — optionally seeding the schema from a `metadata.tsv`. The template is edited in place so its dropdowns, colors and comments are preserved. Writes files only; never uploads. Requires `openpyxl` + `pandas`.
 
 ## Cross-cutting features
 
@@ -56,7 +59,7 @@ Claude Code discovers skills under `~/.claude/skills`. Symlink each skill direct
 # Symlink every skill in this repository into ~/.claude/skills
 mkdir -p ~/.claude/skills
 REPO="$(pwd)"                     # run from the repository root
-for d in geo ena pride arrayexpress biostudies fastq-download-script sra; do
+for d in geo ena pride arrayexpress biostudies fastq-download-script sra addi; do
     ln -s "$REPO/$d" ~/.claude/skills/"$d"
 done
 ```
