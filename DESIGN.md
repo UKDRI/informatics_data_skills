@@ -2,17 +2,21 @@
 
 A collection of Claude Code **Agent Skills** for obtaining metadata and data from
 public life-science data repositories, plus helpers that turn what they find into
-pipeline-ready sample sheets and cluster download scripts.
+pipeline-ready sample sheets, cluster download scripts, and a data-portal
+submission workbook.
 
 ## Purpose
 
-Give an agent (or a human at the CLI) one consistent, dependency-free way to:
+Give an agent (or a human at the CLI) one consistent, mostly dependency-free way
+(stdlib-only except `addi` — see *Conventions*) to:
 
 1. **Search** each repository and **fetch metadata** for an accession.
 2. **List** and **download** the associated data files.
 3. Produce **pipeline inputs** — a harmonized `metadata.tsv` sample table,
    nf-core/scrnaseq or nf-core/rnaseq sample sheets, quantms/DIA-NN minimal SDRFs,
    SLURM-ready bash download scripts, and SRA-tools two-step SLURM job scripts.
+4. Produce a **submission workbook** — fill the UK DRI FAIR-metadata Excel
+   template for upload to the ADDI / AD Workbench data portal (`addi`).
 
 Data sources covered:
 
@@ -25,6 +29,7 @@ Data sources covered:
 | `biostudies` | BioStudies | EMBL-EBI |
 | `fastq-download-script` | (generator, no external API) | — |
 | `sra` | NCBI SRA, via sra-tools (generator, no external API) | — |
+| `addi` | UK DRI FAIR-metadata workbook for the ADDI / AD Workbench portal (generator, no external API) | — |
 
 ## Repository layout
 
@@ -49,12 +54,17 @@ data_skills/
 ├── fastq-download-script/
 │   ├── SKILL.md
 │   └── scripts/make_download_script.py
-└── sra/
+├── sra/
+│   ├── SKILL.md
+│   ├── scripts/sra.py
+│   └── templates/                # cluster-specific job-script boilerplate
+│       ├── run_prefetch.sh
+│       └── run_fasterq-dump.sh
+└── addi/
     ├── SKILL.md
-    ├── scripts/sra.py
-    └── templates/                # cluster-specific job-script boilerplate
-        ├── run_prefetch.sh
-        └── run_fasterq-dump.sh
+    ├── scripts/addi.py
+    └── templates/                # the shipped ADDI submission workbook
+        └── template_UK_DRI_FAIR_Metadata_w_ExtendedCatalogue_V1.2..xlsx
 ```
 
 One skill = one directory = one data source (or one generator). The directory
@@ -64,17 +74,30 @@ name is the skill `name`; `SKILL.md` frontmatter carries the trigger-rich
 `sra` is the first skill with a **`templates/`** folder: it holds literal,
 ready-to-edit SLURM job scripts carrying the UKDRI cluster specifics (partition,
 the sra-tools apptainer image, bind mounts, the `pigz` loop). They are the source
-of truth; the generator fills their `__TOKEN__` placeholders (see below).
+of truth; the generator fills their `__TOKEN__` placeholders (see below). `addi`
+follows the same template-backed idea for a different file type: its `templates/`
+holds the shipped `.xlsx` submission workbook, which the generator opens and fills
+in place (see *addi* below).
 
 ## Conventions (apply to every skill)
 
 - **Standard-library Python only** (`urllib`, `csv`, `json`, `argparse`, `re`).
   No `pip install`, no virtualenv — the scripts run anywhere Python 3 exists.
   This is a deliberate tradeoff: portability and zero-setup over the ergonomics
-  of `requests`/`pandas`.
+  of `requests`/`pandas`. **One documented exception: `addi`.** It must read and
+  write a richly-formatted `.xlsx` workbook (zipped XML with shared strings,
+  styles, dropdown data-validations, and a hidden controlled-vocabulary sheet),
+  which stdlib cannot do faithfully. It therefore depends on **openpyxl** (load and
+  edit the shipped template in place, preserving its validations and colors) and
+  **pandas** (ingesting the dictionaries/fields/lookups tables). `xlsxwriter` is
+  deliberately *not* used: it can only create new workbooks, never edit an existing
+  one, so it could not fill the template without rebuilding every sheet, validation
+  and color from scratch — drifting from the exact file the portal expects.
 - **Self-contained scripts.** Skills do not import from each other. Small helpers
   (HTTP GET with retries, FASTQ R1/R2 pairing, SLURM header) are duplicated across
-  scripts rather than shared, so any skill directory can be copied out and still work.
+  scripts rather than shared, so any skill directory can be copied out and still work
+  once its dependencies are present (stdlib alone for every skill but `addi`, which
+  also needs openpyxl/pandas).
 - **Subcommand CLIs** via `argparse`: `metadata`, `files`, `search`, `download`
   are the common verbs; each skill adds source-specific ones.
 - **`--json` flag** on query commands for machine-readable output; human-readable
@@ -114,7 +137,12 @@ of truth; the generator fills their `__TOKEN__` placeholders (see below).
   otherwise silently pool different biological samples. Every skill implements this
   at each field-write site — a duplicated `_safe_field` helper (control chars → `_`)
   and `_clean_val`, `clean_sample`/`finalize_sample_ids` for the `sample` column —
-  on top of the structural quoting `csv.writer` gives the CSV/TSV outputs.
+  on top of the structural quoting `csv.writer` gives the CSV/TSV outputs. For
+  `addi` the rule adapts to the **xlsx cell model**: a newline inside a cell is
+  legal and cannot break a row, so newlines are preserved; but values are still
+  stripped of the control characters the OOXML format forbids, and any text value
+  beginning with `=`, `+`, `-`, or `@` is prefixed with a leading apostrophe to
+  neutralize spreadsheet formula injection.
 - **Two ways to emit a SLURM script.** Most generators **string-build** the script
   (and its `#SBATCH` header) in Python from generic, commented-placeholder defaults
   (`fastq-download-script`, the `pride` download script). Where the script carries
@@ -193,14 +221,101 @@ of truth; the generator fills their `__TOKEN__` placeholders (see below).
   is identical either way (apptainer accepts a `docker://` URI).
 - Runs `scripts/sra.py job-scripts`, filling `templates/run_{prefetch,fasterq-dump}.sh`.
 
+### addi (generator, template-backed — ADDI / AD Workbench FAIR-metadata workbook)
+- Produces a **submission workbook** rather than querying a repository or building
+  pipeline inputs — and, like `fastq-download-script` and `sra`, makes no network
+  calls. It fills the shipped UK DRI FAIR-metadata Excel template
+  (`templates/template_UK_DRI_FAIR_Metadata_w_ExtendedCatalogue_V1.2..xlsx`) that is
+  uploaded to the ADDI / AD Workbench data portal. The workbook follows the
+  Molgenis/EMX2-style catalogue-import layout (a catalogue plus a data dictionary).
+- **Two halves of one workbook:**
+  - *Catalogue metadata* — the dataset as a whole. `settings` (`visibility`,
+    `workflow_key`, and the `allow_*`/`expose_*` toggles), `workspace_settings`
+    (airlock/geography/owner/auto-approval), `catalogue` (a key/value block: `title`,
+    `description`, `creator`, `contactPoint`, `license`, `versionInfo`, `keyword`,
+    `identifier`, `accessRights`, `publisher_name`, `publisher_url`, `language`), and
+    `extendedcatalogue` (a **form-style** block, rows 7–20: Study Data Language,
+    Data Timepoints, Diseases, Study Types, Biomarkers, human-subjects toggle,
+    participant countries, participant/biosample counts, sample types, Biobank,
+    Organization, Logo, Data Types).
+  - *Data dictionary / schema* — the actual tables and columns. `dictionaries` (one
+    row per data table/file: `code`/`name`/`description`), `fields` (one row per
+    variable: `dictionary_code`, `name`, `label`, `type`, `constraints`→lookup,
+    `description`, `uri`, `entity`, `cohort_filter`), and `lookups` (the enumerated
+    value sets referenced by `fields.constraints`).
+- **Controlled vocabularies live in the hidden `Catalogue_Data` sheet** and are wired
+  into the `extendedcatalogue` dropdowns via list data-validations (col A Study Data
+  Language, B Diseases, C Study Types, D Biomarkers, E participant countries, F sample
+  types, G Data Types, plus Federated-results and Access-Level columns). The skill
+  **reads these from the template** rather than hardcoding them, so it never drifts
+  from the shipped file.
+- **Subcommands** (following the shared verb style):
+  - `info` — describe the template: list its sheets, the mandatory fields
+    (`catalogue` title/description/publisher_name; the `*`-marked `extendedcatalogue`
+    fields), and dump each dropdown's allowed values (`--json` for machine output).
+    Lets an agent discover valid inputs before filling.
+  - `fill` — the core generator. Loads the template and writes user-supplied values
+    into the exact cells, **preserving all dropdowns, prompts, colors, and the hidden
+    vocab sheet**, then saves to `--out`. Inputs, in **increasing precedence**: an
+    optional `--metadata metadata.tsv` seeds the schema (one `fields` row per column,
+    `type` inferred) and descriptive catalogue / extendedcatalogue values (see below);
+    a JSON/YAML `--config` supplies scalar catalogue / extendedcatalogue / settings
+    values; and `--dictionaries` / `--fields` / `--lookups` (TSV or CSV, read with
+    pandas) give the schema tables explicitly. Where they overlap, the explicit
+    `--config` / `--dictionaries` / `--fields` / `--lookups` values override anything
+    seeded from `--metadata`; the always-required user-attributed fields (below) come
+    from `--config` (or an interactive prompt), never from `--metadata`. Multi-select
+    (green) fields spread their values across the Value1..Value6 columns (**max 6**);
+    single-value fields write only Value1 (col D); grey cells are never written. The
+    template ships **pre-filled with example values** (`TITLE`/`DESCRIPTION`/…
+    placeholders, sample dropdown selections) — `fill` overwrites placeholders and
+    clears leftover examples so the output carries only user data.
+  - `validate` — check a filled workbook (or the inputs) against the template's rules
+    without submitting.
+  - All three commands accept `--template PATH` to target a different template file
+    (default: the shipped V1.2 workbook).
+- **Rules enforced** (from the README sheet + the embedded data-validations):
+  mandatory fields present (the README's `title`/`description`/`publisher_name` and
+  the `*`-marked `extendedcatalogue` fields, plus the always-required user-attributed
+  fields below); dropdown values ∈ the `Catalogue_Data` vocab; `visibility`
+  ∈ {private, internal}; catalogue/dictionary `code` = letters/numbers/underscore
+  (dictionary `code` and field `name` additionally must not start with a number);
+  field `type` ∈ {boolean, date, datetime, decimal, integer, text, time}; boolean
+  fields carry no constraints; `fields.dictionary_code` resolves to a
+  `dictionaries.code`; `fields.constraints` / `lookups.lookup` cross-reference;
+  keywords comma-separated.
+- **User-attributed fields are always required from the user.** `creator`
+  (catalogue), `dataset owners` (workspace_settings), and `contactPoint` (catalogue)
+  identify the people and party responsible for the dataset. The template's README
+  marks only `title`/`description`/`publisher_name` as mandatory, but `addi` adds
+  these three as a deliberate **exception to (addition beyond) the README's mandatory
+  set**: they must always be filled from user-provided input, and the skill will not
+  write the workbook until it has all three. The skill (and the agent driving it) must
+  **never guess, infer, or auto-fill them** from the environment, the git identity,
+  the user's email, or any prior context; if the user has not supplied all three,
+  **ask for them before filling** rather than falling back to a default. In
+  particular, the template's shared-org `contactPoint` placeholder
+  (`ukdri-informatics@ukdri.ac.uk`) is **not** consent to keep or reuse it, and the
+  user's personal email is never substituted in — this is the *No unsolicited
+  credentials* rule applied to authorship/contact fields. `publisher_*` are ordinary
+  defaults and may be kept unless the user overrides them.
+- **Inputs are typically derived from a pre-generated `metadata.tsv`.** The normal
+  workflow first runs one of the repository skills' `metadata-table` command (see
+  below) to obtain the harmonized `metadata.tsv` for the study, then feeds it to
+  `addi` (e.g. `fill --metadata metadata.tsv`) so the dictionary/fields and
+  descriptive catalogue values are seeded from that table rather than typed by hand.
+  The user-attributed fields above still come from the user, never from the table.
+- **Generate, don't submit** — `fill` writes the workbook only; the skill never
+  uploads to AD Workbench (mirrors `sra` and the download-script generators).
+
 ## Cross-cutting feature: harmonized metadata table
 
 Every repository skill (`geo`, `ena`, `pride`, `arrayexpress`, `biostudies`)
 exposes a **`metadata-table`** command that writes a **`metadata.tsv`** (default
 `--out metadata.tsv`) — a single tab-delimited table that harmonizes each source's
 native, differently-named sample annotations into one common schema. This is the
-upstream, human-readable view of a study; the sample-sheet builders below consume
-the same underlying records.
+upstream, human-readable view of a study; the sample-sheet builders below — and the
+`addi` submission workbook — consume the same underlying records.
 
 - **One row per sample × replicate.** Each biological sample is emitted once per
   replicate (technical or biological, as the source reports them), so a study with
@@ -347,7 +462,9 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
 ## Key design decisions
 
 1. **Stdlib-only** — maximizes portability for an agent that may run in an
-   arbitrary environment; accepted cost is more verbose HTTP/CSV code.
+   arbitrary environment; accepted cost is more verbose HTTP/CSV code. The single
+   documented exception is `addi`, which needs openpyxl/pandas to fill the `.xlsx`
+   template (see decision 10).
 2. **Self-contained skills over a shared library** — a skill must survive being
    copied out of the collection, so helpers are duplicated intentionally.
 3. **ENA as the FASTQ hub** — GEO and ArrayExpress do not host raw reads, so both
@@ -382,6 +499,14 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
    `sbatch`. The prefetch→fasterq-dump ordering is enforced by the user (or that
    dependency); the tool only writes the scripts and never runs them, like the
    other script generators.
+10. **Fill the template in place, don't rebuild it (`addi`)** — the workbook's
+    dropdowns, per-cell prompts, cell colors and hidden controlled-vocabulary sheet
+    are exactly what the ADDI importer and human reviewers expect. Editing the
+    shipped template with openpyxl preserves all of it and keeps the vocabularies as
+    a single source of truth read at runtime; regenerating with xlsxwriter would
+    duplicate (and risk drifting from) the validations the template already encodes.
+    This — not convenience — is why `addi` is the one skill permitted third-party
+    dependencies. It is the xlsx analog of `sra`'s `__TOKEN__` substitution.
 
 ## Verified endpoint reference
 
@@ -425,3 +550,10 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
   round-trippable, so a cleaned field cannot be mapped back to its original bytes.
   Download-script generators additionally **skip** (with a warning) any URL that
   contains a control character or a `"`, rather than emit it into the shell.
+- **`addi` reads its vocabularies and rules from the shipped template**, so a newer
+  portal template (e.g. V1.3+) may add fields or allowed values: point `--template`
+  at the new file and re-run `info` to resync. The skill fills and validates the
+  workbook but **never submits** it to AD Workbench, and it cannot confirm
+  hub-specific settings — notably which `workflow_key` Data Access Requests are
+  enabled on the target hub (README note 2) — which must be checked against that hub.
+  Multi-select fields are capped at the template's **six** Value columns.
