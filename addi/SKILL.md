@@ -94,6 +94,11 @@ Language"` matches `*Study Data Language (Multi-select)`). Multi-select fields t
 list (max 6 values, spread across the Value1..Value6 columns); single-value fields take
 a scalar.
 
+Unprovided `extendedcatalogue` fields have their shipped example values cleared —
+**except `Organization` and `Logo` (URL)**, which fall back to the template's UK DRI
+defaults (`UK Dementia Research Institute` and `www.ukdri.ac.uk`) unless you override
+them.
+
 ```json
 {
   "catalogue": {

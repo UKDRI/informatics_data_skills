@@ -89,6 +89,11 @@ RE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")   # + cannot start with a numb
 
 VALUE_COLS = ["D", "E", "F", "G", "H", "I"]         # extendedcatalogue Value1..Value6
 
+# extendedcatalogue single-value fields carrying a genuine UK DRI default (not a
+# throwaway example): keep the template's value when the user provides none. Matched on
+# the normalized label; the Logo field is matched by its URL kind (see the fill block).
+EXT_KEEP_DEFAULT_LABELS = {"organization"}
+
 
 # ===========================================================================
 # Output hygiene (xlsx cell model — see DESIGN.md "Clean output fields")
@@ -884,6 +889,10 @@ def build_filled_workbook(tpl, cfg, dictionaries, fields, lookups):
     for f in tpl.ext_fields:
         provided = _lookup_ci(extended, f["label"])
         vals = as_list(provided) if provided is not None else []
+        # Organization / the Logo (URL) field default to the template value when the
+        # user provides none — leave the cell (and any hyperlink) untouched.
+        if not vals and (f["norm"] in EXT_KEEP_DEFAULT_LABELS or f["kind"] == "url"):
+            continue
         ncols = len(VALUE_COLS) if f["multi"] else 1
         for i in range(ncols):
             ref = f"{VALUE_COLS[i]}{f['row']}"

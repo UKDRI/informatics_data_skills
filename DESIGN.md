@@ -269,7 +269,11 @@ in place (see *addi* below).
     single-value fields write only Value1 (col D); grey cells are never written. The
     template ships **pre-filled with example values** (`TITLE`/`DESCRIPTION`/…
     placeholders, sample dropdown selections) — `fill` overwrites placeholders and
-    clears leftover examples so the output carries only user data.
+    clears leftover examples so the output carries only user data. The exceptions are
+    a few cells holding a genuine UK DRI **default** rather than an example: the
+    `catalogue` `license`/`publisher_*`/`language`/`contactPoint` defaults, and the
+    `extendedcatalogue` `Organization` and Logo (`URL`) fields — these are kept when
+    the user provides no value, and cleared/overwritten only when the user does.
   - `validate` — check a filled workbook (or the inputs) against the template's rules
     without submitting.
   - All three commands accept `--template PATH` to target a different template file
