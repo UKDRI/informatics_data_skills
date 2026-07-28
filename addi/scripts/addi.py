@@ -1,0 +1,1439 @@
+#!/usr/bin/env python3
+"""addi — fill the UK DRI FAIR-metadata Excel workbook for an ADDI / AD Workbench
+data-portal submission.
+
+Unlike the other skills in this collection (which are stdlib-only), `addi` reads and
+writes a richly-formatted `.xlsx` template, so it depends on **openpyxl** (reading the
+template's structure, controlled vocabularies and validations) and **pandas** (reading
+the dictionaries/fields/lookups tables and an optional metadata.tsv). See DESIGN.md.
+
+The template ships with dropdown data-validations (some referencing a hidden
+`Catalogue_Data` vocab sheet via the x14 extension), cell colors, per-cell prompts,
+threaded comments and a document sensitivity label. openpyxl's writer silently drops
+most of these on save, so `fill` does **not** save through openpyxl. Instead it edits
+the template *surgically*: it copies every part of the original workbook verbatim and
+rewrites only the `<sheetData>` of the sheets it changes, using inline strings so the
+shared-strings table is left untouched. Everything else — dropdowns, colors, comments,
+the hidden vocab sheet — is preserved byte-for-byte.
+
+Subcommands:
+  info      describe the template (sheets, mandatory fields, dropdown vocabularies)
+  fill      write user-supplied values into the template -> a submission workbook
+  validate  check a filled workbook (or the inputs) against the template's rules
+
+Every command accepts --template PATH to target a different template file (default:
+the shipped V1.2 workbook next to this script).
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import warnings
+import zipfile
+
+# ---------------------------------------------------------------------------
+# Third-party dependencies (see DESIGN.md — the one documented exception to the
+# collection's stdlib-only rule).
+# ---------------------------------------------------------------------------
+try:
+    import openpyxl
+except ImportError:  # pragma: no cover
+    sys.exit("addi requires 'openpyxl' (pip install openpyxl). See DESIGN.md.")
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover
+    sys.exit("addi requires 'pandas' (pip install pandas). See DESIGN.md.")
+
+# openpyxl warns that it will drop the x14 data-validation extension on load. We never
+# save through openpyxl (see module docstring), so the warning is noise here.
+warnings.filterwarnings("ignore", message=".*Data Validation extension.*")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_TEMPLATE = os.path.join(
+    HERE, "..", "templates",
+    "template_UK_DRI_FAIR_Metadata_w_ExtendedCatalogue_V1.2..xlsx",
+)
+
+# Sheet names in the shipped template (note the trailing space in "fields ").
+SHEET_CATALOGUE = "catalogue"
+SHEET_EXTENDED = "extendedcatalogue"
+SHEET_SETTINGS = "settings"
+SHEET_WORKSPACE = "workspace_settings"
+SHEET_DICTIONARIES = "dictionaries"
+SHEET_FIELDS = "fields "
+SHEET_LOOKUPS = "lookups"
+SHEET_VOCAB = "Catalogue_Data"
+
+# Mandatory catalogue keys per the template README, note (4).
+CATALOGUE_MANDATORY = ["title", "description", "publisher_name"]
+
+# The people/party responsible for the dataset. These are *warn-and-default*, not
+# blocking: when the user supplies none, the template's UK DRI value is kept and a WARN
+# asks them to confirm or override it (see DESIGN.md, decision 11). The one hard rule is
+# NEVER GUESS A PERSON — the only permitted fallback is the template's own institutional
+# value, never the environment, the git identity or the user's own email address.
+USER_ATTRIBUTED = [
+    ("catalogue", "creator"),
+    ("catalogue", "contactPoint"),
+    ("workspace_settings", "dataset owners"),
+]
+
+# settings.visibility allowed values per README note (1).
+VISIBILITY_ALLOWED = ["private", "internal"]
+
+# --assay → the `dictionaries` row describing the uploaded processed-counts file, as
+# (canonical code suffix, description, accepted spellings). The set is deliberately **open**
+# (see DESIGN.md): an unrecognised label is accepted with GENERIC_COUNTS_DESCRIPTION and a
+# WARN, never an ERROR. Every code is COUNTS_CODE_PREFIX + '_' + a suffix — there is no bare
+# `counts_data`. This mapping is the skill's own knowledge, not the template's — the one
+# thing `info` reports that a newer template cannot resync.
+ASSAY_COUNTS = [
+    ("scrnaseq", "Processed counts data anndata object file",
+     ("scRNAseq", "scrna", "single-cell RNAseq")),
+    ("bulk_rnaseq", "Processed counts matrix file",
+     ("bulk RNAseq", "bulk", "rnaseq")),
+    ("proteomics", "Processed counts matrix file",
+     ("proteomics",)),
+    ("spatial_transcriptomics", "Processed counts SpatialData .zarr",
+     ("spatial transcriptomics", "spatial", "visium")),
+]
+GENERIC_COUNTS_DESCRIPTION = "Processed counts data file"
+COUNTS_CODE_PREFIX = "counts_data"
+
+# fields.type allowed values per README note (11).
+FIELD_TYPES = ["boolean", "date", "datetime", "decimal", "integer", "text", "time"]
+
+# code / name syntax rules per README notes (3), (8), (9), (10).
+RE_CODE = re.compile(r"^[A-Za-z0-9_]+$")            # letters, numbers, underscore
+RE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")   # + cannot start with a number
+
+# catalogue.identifier must be a DOI or blank (see DESIGN.md). Bare-DOI syntax per
+# ANSI/NISO Z39.84: the "10." prefix, a registrant code, "/", then the suffix.
+RE_DOI = re.compile(r"^10\.\d{4,9}/\S+$")
+DOI_RESOLVER = "https://doi.org/"
+
+VALUE_COLS = ["D", "E", "F", "G", "H", "I"]         # extendedcatalogue Value1..Value6
+
+# The first cell past Value6 ("J"): the sample-type overflow cell, which carries no
+# data-validation and no fill, so a proposed out-of-vocabulary term can be recorded there
+# without corrupting a dropdown (see DESIGN.md).
+OVERFLOW_COL = chr(ord(VALUE_COLS[-1]) + 1)
+
+# The one extendedcatalogue dropdown with an overflow cell. Matched on the normalized
+# label so the row number is read from the template rather than hardcoded (row 16 in the
+# shipped V1.2 workbook).
+EXT_OVERFLOW_FIELD = "type of sample from which data were derived"
+
+# extendedcatalogue single-value fields carrying a genuine UK DRI default (not a
+# throwaway example): keep the template's value when the user provides none. Matched on
+# the normalized label; the Logo field is matched by its URL kind (see the fill block).
+EXT_KEEP_DEFAULT_LABELS = {"organization"}
+
+# catalogue keys whose shipped value is a genuine UK DRI default rather than an example
+# placeholder: kept verbatim when the user supplies nothing, regardless of casing (so the
+# is_caps_placeholder heuristic can never clear one). See DESIGN.md.
+CAT_KEEP_DEFAULT_KEYS = {"license", "publisher_name", "publisher_url", "language",
+                         "contactPoint", "creator", "accessRights"}
+
+# metadata.tsv columns never turned into a lookup: they identify a row, not a category.
+LOOKUP_SKIP_COLUMNS = {"sample", "sample_id", "id", "replicate"}
+
+
+# ===========================================================================
+# Output hygiene (xlsx cell model — see DESIGN.md "Clean output fields")
+# ===========================================================================
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # legal in OOXML: \t \n \r
+
+
+def clean_text(value):
+    """Reduce a value to a safe xlsx text token.
+
+    Newlines are legal inside a cell and are preserved; the control characters the
+    OOXML format forbids are stripped; and a value beginning with =, +, - or @ is
+    prefixed with an apostrophe to neutralize spreadsheet formula injection.
+    """
+    s = "" if value is None else str(value)
+    s = _CONTROL.sub("", s)
+    if s and s[0] in "=+-@":
+        s = "'" + s
+    return s
+
+
+def xml_escape(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;"))
+
+
+# ===========================================================================
+# catalogue.identifier — a DOI, or blank (see DESIGN.md)
+# ===========================================================================
+def normalize_doi(value):
+    """Return (canonical_doi_url, error). Exactly one of the two is None.
+
+    Accepts the bare DOI (10.5281/zenodo.123456), the 'doi:'-prefixed form and the
+    resolver URL (http(s)://(dx.)doi.org/10.…), and returns the canonical
+    'https://doi.org/10.…' form. Anything else — a repository accession, a non-DOI URL,
+    free text — is an error: the field is for a citable dataset DOI, not a source
+    accession.
+    """
+    s = str(value).strip()
+    bare = re.sub(r"(?i)^https?://(?:dx\.)?doi\.org/", "", s)
+    bare = re.sub(r"(?i)^doi:\s*", "", bare).strip()
+    if not RE_DOI.match(bare):
+        return None, (f"'{s}' is not a DOI. Give a DOI (10.xxxx/suffix, doi:10.xxxx/… "
+                      f"or https://doi.org/10.xxxx/…) or leave identifier blank — this "
+                      f"field is for a citable dataset DOI, not a source accession.")
+    return DOI_RESOLVER + bare, None
+
+
+# ===========================================================================
+# Dropdown vocabulary matching
+# ===========================================================================
+def split_by_vocab(values, allowed):
+    """Split values into (matched, unmatched).
+
+    Matching is case-insensitive; a matched value is returned in the vocabulary's own
+    casing so the written cell satisfies the template's dropdown. Order is preserved and
+    duplicates (case-insensitively) are dropped.
+    """
+    canonical = {str(a).strip().lower(): str(a).strip() for a in allowed}
+    matched, unmatched, seen = [], [], set()
+    for v in values:
+        s = str(v).strip()
+        if not s or s.lower() in seen:
+            continue
+        seen.add(s.lower())
+        if s.lower() in canonical:
+            matched.append(canonical[s.lower()])
+        else:
+            unmatched.append(s)
+    return matched, unmatched
+
+
+# ===========================================================================
+# Column-letter helpers
+# ===========================================================================
+def col_to_num(letters):
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
+
+
+def split_ref(ref):
+    m = re.match(r"([A-Z]+)(\d+)", ref)
+    return m.group(1), int(m.group(2))
+
+
+# ===========================================================================
+# Reading the template with openpyxl
+# ===========================================================================
+class Template:
+    """Reads structure, mandatory fields and controlled vocabularies from a template
+    workbook. Read-only; writing is done surgically by fill()."""
+
+    def __init__(self, path):
+        if not os.path.exists(path):
+            sys.exit(f"template not found: {path}")
+        self.path = path
+        self.wb = openpyxl.load_workbook(path, data_only=True)
+        for name in (SHEET_CATALOGUE, SHEET_EXTENDED, SHEET_SETTINGS,
+                     SHEET_WORKSPACE, SHEET_DICTIONARIES, SHEET_FIELDS,
+                     SHEET_LOOKUPS, SHEET_VOCAB):
+            if name not in self.wb.sheetnames:
+                sys.exit(f"template is missing the '{name}' sheet — is this the "
+                         f"expected UK DRI FAIR-metadata workbook?")
+        self._raw_ext = self._read_raw_sheet_xml(SHEET_EXTENDED)
+        self.ext_fields = self._read_extended_fields()
+
+    # -- raw XML access (for parsing data-validations that openpyxl drops) ----
+    def _sheet_filename(self, sheet_title):
+        """Map a sheet title to its xl/worksheets/sheetN.xml path via the rels."""
+        import xml.etree.ElementTree as ET
+        with zipfile.ZipFile(self.path) as z:
+            wbxml = z.read("xl/workbook.xml").decode("utf-8")
+            relsxml = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+        # name -> r:id
+        ns_rid = dict(re.findall(r'<sheet[^>]*name="([^"]*)"[^>]*r:id="(rId\d+)"',
+                                 wbxml))
+        # r:id -> target
+        rid_target = dict(re.findall(r'Id="(rId\d+)"[^>]*Target="(worksheets/[^"]*)"',
+                                     relsxml))
+        rid = ns_rid.get(sheet_title)
+        target = rid_target.get(rid)
+        if not target:
+            sys.exit(f"could not resolve worksheet file for sheet '{sheet_title}'")
+        return "xl/" + target
+
+    def _read_raw_sheet_xml(self, sheet_title):
+        fn = self._sheet_filename(sheet_title)
+        with zipfile.ZipFile(self.path) as z:
+            return z.read(fn).decode("utf-8")
+
+    # -- extendedcatalogue field discovery -----------------------------------
+    def _read_extended_fields(self):
+        """Return ordered list of dicts describing rows 7..20 of extendedcatalogue."""
+        ws = self.wb[SHEET_EXTENDED]
+        validations = self._parse_ext_validations()
+        fields = []
+        for row in range(7, 21):
+            raw_name = ws.cell(row=row, column=1).value
+            if raw_name is None or str(raw_name).strip() == "":
+                continue
+            raw_name = str(raw_name).strip()
+            mandatory = raw_name.startswith("*")
+            label = raw_name.lstrip("*").strip()
+            ftype_txt = (ws.cell(row=row, column=2).value or "").strip().lower()
+            allowed = validations.get(row)  # list of allowed values, or None
+            multi = ("multi-select" in ftype_txt) or ("multi-select" in label.lower())
+            if "integer" in ftype_txt:
+                kind = "integer"
+            elif "toggle" in ftype_txt:
+                kind = "toggle"
+            elif "url" in ftype_txt:
+                kind = "url"
+            elif allowed is not None:
+                kind = "list"
+            else:
+                kind = "text"
+            fields.append({
+                "row": row,
+                "label": label,
+                "norm": normalize_key(label),
+                "mandatory": mandatory,
+                "type_text": ftype_txt,
+                "kind": kind,
+                "multi": multi and kind not in ("integer", "toggle"),
+                "allowed": allowed,
+            })
+        return fields
+
+    def _parse_ext_validations(self):
+        """Map extendedcatalogue row-number -> list of allowed dropdown values.
+
+        Handles both the standard inline list (e.g. the Yes/No toggle) and the x14
+        extension validations that reference a Catalogue_Data column range.
+        """
+        out = {}
+        xml = self._raw_ext
+        # Standard <dataValidation type="list" sqref="D12"><formula1>"Yes, No"</...>
+        for m in re.finditer(
+                r'<dataValidation\b[^>]*\btype="list"[^>]*\bsqref="([^"]+)"[^>]*>'
+                r'\s*<formula1>(.*?)</formula1>', xml, re.S):
+            sqref, formula = m.group(1), m.group(2).strip()
+            row = self._sqref_start_row(sqref)
+            lit = formula.strip().strip('"')
+            values = [v.strip() for v in lit.split(",") if v.strip()]
+            if row and values:
+                out[row] = values
+        # x14 validations: <xm:f>Catalogue_Data!$G$2:$G$28</xm:f> ... <xm:sqref>D20:I20</xm:sqref>
+        for m in re.finditer(
+                r'<x14:dataValidation\b.*?<xm:f>(.*?)</xm:f>.*?'
+                r'<xm:sqref>(.*?)</xm:sqref>.*?</x14:dataValidation>', xml, re.S):
+            formula, sqref = m.group(1).strip(), m.group(2).strip()
+            row = self._sqref_start_row(sqref)
+            values = self._resolve_range(formula)
+            if row and values:
+                out[row] = values
+        return out
+
+    @staticmethod
+    def _sqref_start_row(sqref):
+        first = sqref.split()[0].split(":")[0]
+        m = re.match(r"[A-Z]+(\d+)", first)
+        return int(m.group(1)) if m else None
+
+    def _resolve_range(self, formula):
+        """Resolve 'Catalogue_Data!$G$2:$G$28' -> list of cell values from the sheet."""
+        m = re.match(r"([^!]+)!\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)", formula)
+        if not m:
+            return None
+        sheet, c1, r1, c2, r2 = m.groups()
+        sheet = sheet.strip("'")
+        if sheet not in self.wb.sheetnames:
+            return None
+        ws = self.wb[sheet]
+        col = col_to_num(c1)
+        values = []
+        for r in range(int(r1), int(r2) + 1):
+            v = ws.cell(row=r, column=col).value
+            if v is not None and str(v).strip():
+                values.append(str(v).strip())
+        return values
+
+    # -- vocab dump for `info` ------------------------------------------------
+    def vocab_columns(self):
+        """Return {header: [values]} for every column of the hidden vocab sheet."""
+        ws = self.wb[SHEET_VOCAB]
+        out = {}
+        for col in range(1, ws.max_column + 1):
+            header = ws.cell(row=1, column=col).value
+            if not header:
+                continue
+            vals = []
+            for r in range(2, ws.max_row + 1):
+                v = ws.cell(row=r, column=col).value
+                if v is not None and str(v).strip():
+                    vals.append(str(v).strip())
+            out[str(header).strip()] = vals
+        return out
+
+    def catalogue_keys(self):
+        ws = self.wb[SHEET_CATALOGUE]
+        return [str(ws.cell(row=r, column=1).value).strip()
+                for r in range(2, ws.max_row + 1)
+                if ws.cell(row=r, column=1).value]
+
+    def settings_keys(self):
+        ws = self.wb[SHEET_SETTINGS]
+        return [str(ws.cell(row=r, column=1).value).strip()
+                for r in range(2, ws.max_row + 1)
+                if ws.cell(row=r, column=1).value]
+
+    def workspace_keys(self):
+        ws = self.wb[SHEET_WORKSPACE]
+        # keys live in column B (column A is empty for data rows)
+        return [str(ws.cell(row=r, column=2).value).strip()
+                for r in range(2, ws.max_row + 1)
+                if ws.cell(row=r, column=2).value]
+
+    def shipped_value(self, sheet, key):
+        """The value the template ships for a key/value sheet row, or '' if absent.
+
+        Used to report the default that will be kept — read from the template so the
+        message never drifts from the shipped file.
+        """
+        ws = self.wb[sheet]
+        key_col, val_col = (2, 3) if sheet == SHEET_WORKSPACE else (1, 2)
+        for r in range(2, ws.max_row + 1):
+            k = ws.cell(row=r, column=key_col).value
+            if k is not None and str(k).strip() == key:
+                v = ws.cell(row=r, column=val_col).value
+                return "" if v is None else str(v).strip()
+        return ""
+
+    def overflow_field(self):
+        """The one extendedcatalogue field with an overflow cell, or None."""
+        for f in self.ext_fields:
+            if f["norm"] == EXT_OVERFLOW_FIELD:
+                return f
+        return None
+
+
+def normalize_key(label):
+    """Normalize a field label for matching: drop leading '*', a trailing
+    parenthetical like '(Multi-select)', collapse whitespace, lowercase."""
+    s = str(label).lstrip("*").strip()
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", s)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+# ===========================================================================
+# Surgical worksheet XML editing
+# ===========================================================================
+class SheetXML:
+    """Edit a single worksheet's <sheetData> in place, preserving everything else
+    (styles, dropdowns, extLst, comments references)."""
+
+    def __init__(self, xml):
+        self.xml = xml
+        m = re.search(r"(<sheetData\b[^>]*>)(.*?)(</sheetData>)", xml, re.S)
+        if not m:
+            raise ValueError("no <sheetData> in worksheet XML")
+        self._pre = xml[:m.start()]
+        self._open = m.group(1)
+        self._body = m.group(2)
+        self._close = m.group(3)
+        self._post = xml[m.end():]
+        self.rows = self._parse_rows(self._body)  # {row_num: {"attrs":str, "cells":{ref:cellxml}}}
+
+    @staticmethod
+    def _parse_rows(body):
+        rows = {}
+        for rm in re.finditer(r"<row\b([^>]*?)(?:/>|>(.*?)</row>)", body, re.S):
+            attrs, inner = rm.group(1), rm.group(2) or ""
+            num = int(re.search(r'\br="(\d+)"', attrs).group(1))
+            cells = {}
+            for cm in re.finditer(r'<c\b[^>]*\br="([A-Z]+\d+)".*?(?:/>|>.*?</c>)',
+                                  inner, re.S):
+                cells[cm.group(1)] = cm.group(0)
+            rows[num] = {"attrs": attrs, "cells": cells}
+        return rows
+
+    @staticmethod
+    def _style_of(cell_xml):
+        if cell_xml is None:
+            return None
+        m = re.search(r'\bs="(\d+)"', cell_xml)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def build_cell(ref, value, style=None, kind="auto"):
+        """Build a <c> element. kind: 'str', 'num', 'bool', 'empty', or 'auto'."""
+        s_attr = f' s="{style}"' if style is not None else ""
+        if kind == "empty" or value is None or (kind == "auto" and value == ""):
+            return f'<c r="{ref}"{s_attr}/>'
+        if kind == "bool":
+            b = "1" if bool_from(value) else "0"
+            return f'<c r="{ref}"{s_attr} t="b"><v>{b}</v></c>'
+        if kind == "num" or (kind == "auto" and isinstance(value, (int, float))
+                             and not isinstance(value, bool)):
+            num = value
+            if isinstance(num, float) and num.is_integer():
+                num = int(num)
+            return f'<c r="{ref}"{s_attr}><v>{num}</v></c>'
+        text = xml_escape(clean_text(value))
+        return (f'<c r="{ref}"{s_attr} t="inlineStr"><is>'
+                f'<t xml:space="preserve">{text}</t></is></c>')
+
+    def set_cell(self, ref, value, kind="auto", style="keep", default_style=None):
+        """Set/replace/insert a cell. style='keep' preserves the existing cell's
+        style (falling back to default_style if the cell is absent)."""
+        col, rownum = split_ref(ref)
+        if rownum not in self.rows:
+            self.rows[rownum] = {"attrs": f' r="{rownum}"', "cells": {}}
+        row = self.rows[rownum]
+        existing = row["cells"].get(ref)
+        st = self._style_of(existing) if style == "keep" else style
+        if st is None and default_style is not None:
+            st = default_style
+        row["cells"][ref] = self.build_cell(ref, value, style=st, kind=kind)
+
+    def replace_data_rows(self, header_row, new_rows):
+        """Keep rows up to and including header_row; replace all rows below with
+        new_rows = list of {ref: <c-xml>} dicts (already built)."""
+        self.rows = {n: r for n, r in self.rows.items() if n <= header_row}
+        for i, cells in enumerate(new_rows):
+            self.rows[header_row + 1 + i] = {
+                "attrs": f' r="{header_row + 1 + i}" spans="1:9"',
+                "cells": cells,
+            }
+
+    def drop_hyperlinks(self, refs):
+        """Remove <hyperlink> entries for the given cell refs (they live after
+        </sheetData>), so a cell we overwrote or cleared does not keep a stale link
+        (e.g. the template's mailto: on contactPoint). Orphaned external relationships
+        in the sheet .rels are harmless and left in place."""
+        refset = set(refs)
+        if "<hyperlinks" not in self._post:
+            return
+
+        def repl(m):
+            kept = [hl for hl in re.findall(r"<hyperlink\b.*?(?:/>|</hyperlink>)",
+                                            m.group(1), re.S)
+                    if re.search(r'\bref="([^"]+)"', hl).group(1) not in refset]
+            return f"<hyperlinks>{''.join(kept)}</hyperlinks>" if kept else ""
+
+        self._post = re.sub(r"<hyperlinks>(.*?)</hyperlinks>", repl, self._post, flags=re.S)
+
+    def serialize(self):
+        parts = []
+        for num in sorted(self.rows):
+            row = self.rows[num]
+            cells = row["cells"]
+            ordered = sorted(cells, key=lambda ref: col_to_num(split_ref(ref)[0]))
+            inner = "".join(cells[ref] for ref in ordered)
+            if inner:
+                parts.append(f"<row{row['attrs']}>{inner}</row>")
+            else:
+                parts.append(f"<row{row['attrs']}/>")
+        return self._pre + self._open + "".join(parts) + self._close + self._post
+
+
+def bool_from(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
+
+
+# ===========================================================================
+# Config loading
+# ===========================================================================
+def load_config(path):
+    if path is None:
+        return {}
+    if not os.path.exists(path):
+        sys.exit(f"config not found: {path}")
+    text = open(path, encoding="utf-8").read()
+    if path.lower().endswith((".yml", ".yaml")):
+        try:
+            import yaml
+        except ImportError:
+            sys.exit("PyYAML is not installed; convert the config to JSON or "
+                     "'pip install pyyaml'.")
+        return yaml.safe_load(text) or {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        sys.exit(f"could not parse JSON config {path}: {e}")
+
+
+def read_table(path):
+    """Read a dictionaries/fields/lookups table (TSV or CSV) into a DataFrame."""
+    if not os.path.exists(path):
+        sys.exit(f"table not found: {path}")
+    sep = "\t" if path.lower().endswith((".tsv", ".txt")) else ","
+    df = pd.read_csv(path, sep=sep, dtype=str, keep_default_na=False)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+# ===========================================================================
+# metadata.tsv seeding
+# ===========================================================================
+def infer_field_type(series):
+    vals = [v for v in series.tolist() if str(v).strip() not in ("", "NA")]
+    if not vals:
+        return "text"
+    def all_match(fn):
+        for v in vals:
+            try:
+                fn(v)
+            except (ValueError, TypeError):
+                return False
+        return True
+    if all_match(lambda v: int(str(v))):
+        return "integer"
+    if all_match(lambda v: float(str(v))):
+        return "decimal"
+    if all(re.match(r"^\d{4}-\d{2}-\d{2}$", str(v)) for v in vals):
+        return "date"
+    return "text"
+
+
+def sanitize_name(col):
+    name = re.sub(r"[^A-Za-z0-9_]", "_", str(col).strip())
+    if not name or name[0].isdigit():
+        name = "_" + name
+    return name
+
+
+def normalize_assay(label):
+    """Match key for an assay label: lower-cased with non-alphanumerics dropped, so
+    'scRNAseq', 'scrna' and 'single-cell RNAseq' collapse toward the same entry."""
+    return re.sub(r"[^a-z0-9]+", "", str(label).lower())
+
+
+ASSAY_LOOKUP = {normalize_assay(sp): (suffix, desc)
+                for suffix, desc, spellings in ASSAY_COUNTS for sp in spellings}
+
+
+def assay_suffix(label):
+    """Code suffix for an unrecognised assay label: lower-cased, runs of non-alphanumerics
+    collapsed to one underscore, trimmed. Returns '' when the label yields nothing usable
+    (e.g. '???'), which sends the caller to the positional fallback."""
+    return re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_")
+
+
+def parse_assay_args(values):
+    """Flatten repeated --assay values into [(label, description or None)].
+
+    A value carrying an explicit `label=description` is taken whole, so a description may
+    contain commas; any other value may be a comma-separated list of labels.
+    """
+    out = []
+    for raw in values or []:
+        parts = [raw] if "=" in raw else str(raw).split(",")
+        for part in parts:
+            label, sep, desc = part.partition("=")
+            label = label.strip()
+            if label:
+                out.append((label, desc.strip() if sep else None))
+    return out
+
+
+def counts_data_rows(assay_values, existing_codes, warn):
+    """Build the counts_data dictionary rows for --assay (see DESIGN.md).
+
+    `existing_codes` is every code already in the dictionaries table, so a candidate can be
+    checked against the whole sheet rather than only against its siblings. No input
+    combination can yield a duplicate code, and no label is ever an ERROR.
+    """
+    taken = {str(c).strip() for c in existing_codes}
+    rows, seen, counter = [], {}, 0
+    for label, given_desc in parse_assay_args(assay_values):
+        known = ASSAY_LOOKUP.get(normalize_assay(label))
+        if known:
+            suffix, description = known[0], given_desc or known[1]
+        else:
+            suffix, description = assay_suffix(label), given_desc or GENERIC_COUNTS_DESCRIPTION
+            if given_desc is None:
+                warn(f"--assay '{label}' is not a recognised assay "
+                     f"({', '.join(s for _, _, sp in ASSAY_COUNTS for s in sp[:1])}, …) — "
+                     f"using the generic description '{GENERIC_COUNTS_DESCRIPTION}'. Pass "
+                     f"--assay '{label}=<description>' to set it.")
+        # De-duplicate on the resolved identity, not the spelling: 'scrna', 'scRNAseq' and
+        # 'single-cell RNAseq' are one assay and must yield one row. Labels too degenerate
+        # to produce a suffix fall back to their raw text, so two different unusable labels
+        # stay distinct.
+        identity = suffix or label.strip().lower()
+        if identity in seen:
+            warn(f"--assay '{label}' repeats '{seen[identity]}' — ignored.")
+            continue
+        seen[identity] = label
+        code = f"{COUNTS_CODE_PREFIX}_{suffix}" if suffix else ""
+        if not code or code in taken:
+            while True:
+                counter += 1
+                fallback = f"{COUNTS_CODE_PREFIX}_{counter}"
+                if fallback not in taken:
+                    break
+            warn(f"--assay '{label}': "
+                 + (f"code '{code}' is already used in the dictionaries sheet"
+                    if code else "the label yields no usable code suffix")
+                 + f" — using '{fallback}' instead.")
+            code = fallback
+        taken.add(code)
+        # code == name for every row, matching the template's lower-case `imaging` row.
+        rows.append({"code": code, "name": code, "description": description})
+    return rows
+
+
+def distinct_values(series):
+    """Ordered distinct non-empty, non-'NA' values of a column."""
+    out, seen = [], set()
+    for v in series.tolist():
+        s = str(v).strip()
+        if s == "" or s == "NA" or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def seed_from_metadata(path, dict_code, lookup_max_values, warn):
+    """Return (dictionaries_df, fields_df, lookups_df, extended_seed) from a metadata.tsv.
+
+    All three schema tables are seeded: one dictionary for the table, one `fields` row per
+    column, and `lookups` derived from each categorical column's unique values (see
+    DESIGN.md for the qualifying criteria).
+    """
+    df = read_table(path)
+    if not RE_CODE.match(dict_code) or dict_code[0].isdigit():
+        sys.exit(f"--metadata-dict-code '{dict_code}' must be letters/numbers/"
+                 f"underscore and not start with a number.")
+    dictionaries = pd.DataFrame(
+        [{"code": dict_code, "name": dict_code.replace("_", " ").title(),
+          "description": f"Seeded from {os.path.basename(path)}"}])
+
+    nrows = int(len(df))
+    frows, lrows, seen_lookups = [], [], {}
+    for col in df.columns:
+        name = sanitize_name(col)
+        if name != col:
+            warn(f"metadata column '{col}' -> field name '{name}'")
+        ftype = infer_field_type(df[col])
+
+        # lookups: a text column whose distinct values form a small enumeration becomes a
+        # lookup, and this field's `constraints` points at it.
+        constraints = ""
+        if ftype == "text" and col.strip().lower() not in LOOKUP_SKIP_COLUMNS \
+                and name.lower() not in LOOKUP_SKIP_COLUMNS:
+            vals = distinct_values(df[col])
+            if 2 <= len(vals) <= lookup_max_values and len(vals) < nrows:
+                lookup = name.upper()
+                if lookup in seen_lookups:
+                    warn(f"metadata column '{col}' would reuse lookup name '{lookup}' "
+                         f"(already seeded from '{seen_lookups[lookup]}') — left without "
+                         f"constraints; supply --lookups to disambiguate.")
+                else:
+                    seen_lookups[lookup] = col
+                    constraints = lookup
+                    for v in sorted(vals):
+                        lrows.append({"lookup": lookup, "name": v,
+                                      "description": v, "uri": ""})
+                    warn(f"seeded lookup '{lookup}' ({len(vals)} value(s)) and "
+                         f"fields.constraints for column '{col}' — these are only the "
+                         f"values present in {os.path.basename(path)}; review for "
+                         f"completeness.")
+
+        frows.append({
+            "dictionary_code": dict_code, "name": name, "label": str(col),
+            "type": ftype, "constraints": constraints,
+            "description": "", "uri": "",
+            "entity": "true" if name.lower() in ("id", "sample", "sample_id") else "false",
+            "cohort_filter": "false",
+        })
+    fields = pd.DataFrame(frows)
+    lookups = pd.DataFrame(lrows) if lrows else None
+
+    # Conservative descriptive seeding (guesses — warned, overridden by --config).
+    extended_seed = {}
+    id_col = next((c for c in df.columns if c.lower() in ("sample", "sample_id", "id")),
+                  None)
+    n = int(df[id_col].nunique()) if id_col else nrows
+    extended_seed["Number of Biosamples"] = n
+    warn(f"seeded 'Number of Biosamples' = {n} (from metadata.tsv; review).")
+
+    # Sample types come from `tissue`, falling back to sample_type / source_name. The
+    # values are seeded raw; matching them against the template vocabulary (and routing
+    # anything unmatched to the overflow cell) happens in one place, at validate/fill.
+    tissue_col = next((c for c in df.columns
+                       if c.strip().lower() in ("tissue", "sample_type", "source_name")),
+                      None)
+    if tissue_col:
+        vals = distinct_values(df[tissue_col])
+        if vals:
+            extended_seed["Type of Sample From Which Data Were Derived"] = vals
+            warn(f"seeded sample types from metadata column '{tissue_col}': "
+                 f"{', '.join(vals)} (review).")
+    return dictionaries, fields, lookups, extended_seed
+
+
+# ===========================================================================
+# Validation
+# ===========================================================================
+def validate_inputs(tpl, cfg, dictionaries, fields, lookups):
+    """Return a list of (severity, message). severity in {'ERROR','WARN'}."""
+    issues = []
+    cat = cfg.get("catalogue", {}) or {}
+    ws = cfg.get("workspace_settings", {}) or {}
+    settings = cfg.get("settings", {}) or {}
+    extended = cfg.get("extendedcatalogue", {}) or {}
+
+    def is_empty(v):
+        return v is None or str(v).strip() == ""
+
+    # catalogue mandatory (README note 4)
+    for key in CATALOGUE_MANDATORY:
+        if is_empty(cat.get(key)):
+            issues.append(("ERROR", f"catalogue.{key} is mandatory (README note 4)."))
+
+    # catalogue.identifier must be a DOI or blank (see DESIGN.md)
+    ident = cat.get("identifier")
+    if not is_empty(ident):
+        canonical, err = normalize_doi(ident)
+        if err:
+            issues.append(("ERROR", f"catalogue.identifier {err}"))
+        elif canonical != str(ident).strip():
+            issues.append(("WARN", f"catalogue.identifier '{str(ident).strip()}' will be "
+                                   f"normalized to '{canonical}'."))
+
+    # user-attributed fields: warn-and-default, never blocking (see DESIGN.md)
+    for sheet, key in USER_ATTRIBUTED:
+        src = cat if sheet == "catalogue" else ws
+        if is_empty(src.get(key)):
+            default = tpl.shipped_value(sheet, key)
+            issues.append(("WARN",
+                           f"{sheet}.'{key}' not supplied — keeping the template's "
+                           f"default '{default}'. Confirm it or override it; it is never "
+                           f"inferred from the environment or your identity."))
+
+    # settings.visibility (README note 1)
+    vis = settings.get("visibility")
+    if vis is not None and str(vis).strip() and str(vis).strip() not in VISIBILITY_ALLOWED:
+        issues.append(("ERROR", f"settings.visibility '{vis}' must be one of "
+                                f"{VISIBILITY_ALLOWED} (README note 1)."))
+
+    # extendedcatalogue: mandatory + dropdown membership + multi-select cap
+    for f in tpl.ext_fields:
+        provided = _lookup_ci(extended, f["label"])
+        vals = as_list(provided)
+        if f["mandatory"] and not vals:
+            issues.append(("ERROR", f"extendedcatalogue '{f['label']}' is mandatory."))
+        if f["allowed"] is not None and vals:
+            # The sample-type field is the one dropdown with an overflow cell: a value the
+            # vocabulary cannot express is reported and recorded in the overflow cell as a
+            # proposal, not rejected. Every other dropdown still hard-ERRORs.
+            if f["norm"] == EXT_OVERFLOW_FIELD:
+                vals, overflow = split_by_vocab(vals, f["allowed"])
+                for v in overflow:
+                    issues.append((
+                        "WARN", f"extendedcatalogue '{f['label']}' value '{v}' is not in "
+                                f"the template vocabulary ({', '.join(f['allowed'])}) — "
+                                f"it goes into the {OVERFLOW_COL}{f['row']} overflow cell "
+                                f"as a proposed new term. Confirm it with ADDI before "
+                                f"submitting."))
+            else:
+                allowed_ci = {a.lower(): a for a in f["allowed"]}
+                for v in vals:
+                    if str(v).strip().lower() not in allowed_ci:
+                        issues.append(("ERROR", f"extendedcatalogue '{f['label']}' value "
+                                                f"'{v}' is not in the allowed dropdown "
+                                                f"list."))
+        if f["multi"] and len(vals) > len(VALUE_COLS):
+            issues.append(("ERROR", f"extendedcatalogue '{f['label']}' has {len(vals)} "
+                                    f"values but only {len(VALUE_COLS)} are allowed."))
+        if not f["multi"] and len(vals) > 1:
+            issues.append(("ERROR", f"extendedcatalogue '{f['label']}' is single-value "
+                                    f"but {len(vals)} values were given."))
+        if f["kind"] == "integer" and vals:
+            try:
+                int(str(vals[0]))
+            except ValueError:
+                issues.append(("ERROR", f"extendedcatalogue '{f['label']}' must be an "
+                                        f"integer, got '{vals[0]}'."))
+
+    issues += validate_schema(dictionaries, fields, lookups)
+    return issues
+
+
+def validate_schema(dictionaries, fields, lookups):
+    issues = []
+    dict_codes = set()
+    if dictionaries is not None:
+        for _, r in dictionaries.iterrows():
+            code = str(r.get("code", "")).strip()
+            if not code:
+                continue
+            if code in dict_codes:
+                issues.append(("ERROR", f"dictionaries.code '{code}' appears more than "
+                                        f"once; codes must be unique within the sheet — it "
+                                        f"is the key fields.dictionary_code resolves "
+                                        f"against, so a duplicate silently merges two "
+                                        f"tables (README note 9)."))
+            dict_codes.add(code)
+            if not RE_CODE.match(code) or code[0].isdigit():
+                issues.append(("ERROR", f"dictionaries.code '{code}' must be letters/"
+                                        f"numbers/underscore and not start with a number "
+                                        f"(README notes 3, 8)."))
+    lookup_names = set()
+    if lookups is not None:
+        for _, r in lookups.iterrows():
+            lk = str(r.get("lookup", "")).strip()
+            if lk:
+                lookup_names.add(lk)
+    if fields is not None:
+        for _, r in fields.iterrows():
+            name = str(r.get("name", "")).strip()
+            dc = str(r.get("dictionary_code", "")).strip()
+            ftype = str(r.get("type", "")).strip().lower()
+            constraints = str(r.get("constraints", "")).strip()
+            if name and not RE_NAME.match(name):
+                issues.append(("ERROR", f"fields.name '{name}' must be letters/numbers/"
+                                        f"underscore and not start with a number "
+                                        f"(README note 10)."))
+            if dc and dict_codes and dc not in dict_codes:
+                issues.append(("ERROR", f"fields.dictionary_code '{dc}' has no matching "
+                                        f"row in dictionaries (README note 9)."))
+            if ftype and ftype not in FIELD_TYPES:
+                issues.append(("ERROR", f"fields.type '{ftype}' must be one of "
+                                        f"{FIELD_TYPES} (README note 11)."))
+            if ftype == "boolean" and constraints:
+                issues.append(("ERROR", f"fields '{name}' is boolean and cannot have "
+                                        f"constraints (README note 12)."))
+            if constraints and lookup_names and constraints not in lookup_names:
+                issues.append(("WARN", f"fields.constraints '{constraints}' has no "
+                                       f"matching lookup in the lookups sheet "
+                                       f"(README note 13)."))
+    return issues
+
+
+def _lookup_ci(d, key):
+    """Case/normalize-insensitive lookup into a dict by field label."""
+    if key in d:
+        return d[key]
+    nk = normalize_key(key)
+    for k, v in d.items():
+        if normalize_key(k) == nk:
+            return v
+    return None
+
+
+def as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [v for v in value if str(v).strip() != ""]
+    s = str(value).strip()
+    return [s] if s else []
+
+
+# ===========================================================================
+# Subcommands
+# ===========================================================================
+def cmd_info(args):
+    tpl = Template(args.template)
+    if args.json:
+        out = {
+            "sheets": tpl.wb.sheetnames,
+            "catalogue_keys": tpl.catalogue_keys(),
+            "catalogue_mandatory": CATALOGUE_MANDATORY,
+            "catalogue_identifier": "a DOI, or blank (normalized to "
+                                    "https://doi.org/10.…)",
+            "user_attributed_defaults": {
+                f"{s}.{k}": tpl.shipped_value(s, k) for s, k in USER_ATTRIBUTED},
+            "settings_keys": tpl.settings_keys(),
+            "settings_visibility_allowed": VISIBILITY_ALLOWED,
+            "workspace_keys": tpl.workspace_keys(),
+            "extendedcatalogue_fields": [
+                {"label": f["label"], "mandatory": f["mandatory"],
+                 "kind": f["kind"], "multi": f["multi"], "allowed": f["allowed"]}
+                for f in tpl.ext_fields],
+            "field_types": FIELD_TYPES,
+            "vocabularies": tpl.vocab_columns(),
+            # Skill knowledge, not read from the template — a newer template cannot
+            # resync it (see DESIGN.md).
+            "assays": {
+                "recognised": [
+                    {"spellings": list(spellings),
+                     "code": f"{COUNTS_CODE_PREFIX}_{suffix}", "description": desc}
+                    for suffix, desc, spellings in ASSAY_COUNTS],
+                "open_set": f"any other label is accepted, with the generic description "
+                            f"'{GENERIC_COUNTS_DESCRIPTION}' and a WARN; pass "
+                            f"--assay 'label=description' to set it",
+            },
+        }
+        ovf = tpl.overflow_field()
+        if ovf:
+            out["overflow_cell"] = {
+                "field": ovf["label"], "cell": f"{OVERFLOW_COL}{ovf['row']}",
+                "note": "values outside this field's vocabulary are recorded here as a "
+                        "proposal (WARN) instead of being rejected",
+            }
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return
+
+    print(f"Template: {os.path.basename(tpl.path)}")
+    print(f"Sheets:   {', '.join(tpl.wb.sheetnames)}\n")
+    print("catalogue keys (mandatory marked *):")
+    for k in tpl.catalogue_keys():
+        star = " *" if k in CATALOGUE_MANDATORY else ""
+        print(f"  {k}{star}")
+    print("\nidentifier: a DOI, or blank (normalized to https://doi.org/10.…)")
+    print("accessRights: optional, free text (template default: "
+          f"'{tpl.shipped_value(SHEET_CATALOGUE, 'accessRights')}')")
+    print("\nResponsible-party fields — kept at the template default unless you "
+          "override them.\nAsk the user whether to change these; never infer them:")
+    for s, k in USER_ATTRIBUTED:
+        print(f"  {s}.{k} = '{tpl.shipped_value(s, k)}'")
+    print(f"\nsettings.visibility allowed: {', '.join(VISIBILITY_ALLOWED)}")
+    print("\nextendedcatalogue fields (mandatory marked *):")
+    for f in tpl.ext_fields:
+        star = "*" if f["mandatory"] else " "
+        tag = f["kind"] + ("[multi]" if f["multi"] else "")
+        n = f" — {len(f['allowed'])} allowed values" if f["allowed"] else ""
+        print(f"  {star} {f['label']}  ({tag}){n}")
+    ovf = tpl.overflow_field()
+    if ovf:
+        print(f"\nOverflow cell {OVERFLOW_COL}{ovf['row']} ('{ovf['label']}'): a value "
+              f"outside this field's\nvocabulary is recorded there as a proposal (WARN) "
+              f"instead of being rejected.")
+    print("\n--assay → the counts_data dictionary row for the uploaded counts file")
+    print("(the skill's own mapping, not read from the template):")
+    for suffix, desc, spellings in ASSAY_COUNTS:
+        print(f"  {' | '.join(spellings)}")
+        print(f"      -> {COUNTS_CODE_PREFIX}_{suffix}  |  {desc}")
+    print(f"  any other label is accepted too -> counts_data_<label>  |  "
+          f"'{GENERIC_COUNTS_DESCRIPTION}' (WARN)")
+    print("  pass --assay 'label=description' to set the description yourself")
+    print(f"\nfields.type allowed: {', '.join(FIELD_TYPES)}")
+    print("\nControlled vocabularies (hidden Catalogue_Data sheet):")
+    for name, vals in tpl.vocab_columns().items():
+        preview = ", ".join(vals[:8]) + (" ..." if len(vals) > 8 else "")
+        print(f"  {name} ({len(vals)}): {preview}")
+    print("\nUse --json for the full machine-readable dump (all allowed values).")
+
+
+def read_filled_workbook(tpl, path):
+    """Read values back out of a filled workbook into the same (cfg, dictionaries,
+    fields, lookups) shape the input path uses, so validate can check either."""
+    if not os.path.exists(path):
+        sys.exit(f"workbook not found: {path}")
+    wb = openpyxl.load_workbook(path, data_only=True)
+
+    def kv(sheet, key_col, val_col):
+        ws = wb[sheet]
+        out = {}
+        for r in range(2, ws.max_row + 1):
+            k = ws.cell(row=r, column=key_col).value
+            if k is None or str(k).strip() == "":
+                continue
+            out[str(k).strip()] = ws.cell(row=r, column=val_col).value
+        return out
+
+    cfg = {
+        "catalogue": kv(SHEET_CATALOGUE, 1, 2),
+        "settings": kv(SHEET_SETTINGS, 1, 2),
+        "workspace_settings": kv(SHEET_WORKSPACE, 2, 3),
+        "extendedcatalogue": {},
+    }
+    ext_ws = wb[SHEET_EXTENDED]
+    for f in tpl.ext_fields:
+        # The sample-type row is read one column wider so a proposed term parked in the
+        # overflow cell round-trips and is reported by validation.
+        last = OVERFLOW_COL if f["norm"] == EXT_OVERFLOW_FIELD else VALUE_COLS[-1]
+        overflow_col = col_to_num(OVERFLOW_COL)
+        vals = []
+        for col in range(col_to_num(VALUE_COLS[0]), col_to_num(last) + 1):
+            v = ext_ws.cell(row=f["row"], column=col).value
+            if v is None or str(v).strip() == "":
+                continue
+            if col == overflow_col:
+                # the overflow cell holds comma-separated proposed terms
+                vals.extend(s.strip() for s in str(v).split(",") if s.strip())
+            else:
+                vals.append(v)
+        if vals:
+            cfg["extendedcatalogue"][f["label"]] = vals
+
+    def table(sheet):
+        ws = wb[sheet]
+        headers = [str(ws.cell(row=1, column=c).value).strip()
+                   for c in range(1, ws.max_column + 1)]
+        rows = []
+        for r in range(2, ws.max_row + 1):
+            vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+            if all(v is None or str(v).strip() == "" for v in vals):
+                continue
+            rows.append({h: ("" if v is None else str(v)) for h, v in zip(headers, vals)})
+        return pd.DataFrame(rows) if rows else None
+
+    return cfg, table(SHEET_DICTIONARIES), table(SHEET_FIELDS), table(SHEET_LOOKUPS)
+
+
+def cmd_validate(args):
+    tpl = Template(args.template)
+    if args.workbook:
+        cfg, dictionaries, fields, lookups = read_filled_workbook(tpl, args.workbook)
+    else:
+        cfg = load_config(args.config)
+        dictionaries = read_table(args.dictionaries) if args.dictionaries else None
+        fields = read_table(args.fields) if args.fields else None
+        lookups = read_table(args.lookups) if args.lookups else None
+    issues = validate_inputs(tpl, cfg, dictionaries, fields, lookups)
+    _report(issues)
+    if any(sev == "ERROR" for sev, _ in issues):
+        sys.exit(1)
+    print("OK — inputs satisfy the template's rules.", file=sys.stderr)
+
+
+def _report(issues):
+    for sev, msg in issues:
+        print(f"{sev}: {msg}", file=sys.stderr)
+
+
+def cmd_fill(args):
+    tpl = Template(args.template)
+    cfg = load_config(args.config)
+    warnings_out = []
+    warn = lambda m: warnings_out.append(m)
+
+    # --- assemble schema tables, applying precedence: metadata < config-file tables
+    dictionaries = fields = lookups = None
+    ext_seed = {}
+    if args.metadata:
+        dictionaries, fields, lookups, ext_seed = seed_from_metadata(
+            args.metadata, args.metadata_dict_code, args.lookup_max_values, warn)
+    if args.dictionaries:
+        dictionaries = read_table(args.dictionaries)
+    if args.fields:
+        fields = read_table(args.fields)
+    if args.lookups:
+        lookups = read_table(args.lookups)  # replaces any seeded set wholesale
+
+    # --- counts_data row(s) from --assay: appended to the seed, never overriding it. An
+    # explicit --dictionaries replaces the whole sheet, so the rows are dropped there.
+    if args.assay and args.dictionaries:
+        warn("--dictionaries replaces the dictionaries sheet, so the --assay counts_data "
+             "row(s) were not added.")
+    elif args.assay:
+        existing = (dictionaries["code"].tolist()
+                    if dictionaries is not None and "code" in dictionaries else [])
+        rows = counts_data_rows(args.assay, existing, warn)
+        if rows:
+            added = pd.DataFrame(rows)
+            dictionaries = (added if dictionaries is None
+                            else pd.concat([dictionaries, added], ignore_index=True))
+    elif not args.dictionaries:
+        warn("no --assay given, so no counts_data row describes the uploaded counts file. "
+             "The assay is not in metadata.tsv — ask the user which technology "
+             "(scRNAseq / bulk RNAseq / proteomics / spatial transcriptomics / other) the "
+             "submission covers.")
+
+    # --- the three schema sheets stand or fall together. The template's example rows
+    # cross-reference each other (fields.dictionary_code -> test_demographics,
+    # fields.constraints -> SEX), so keeping one sheet's examples while another is replaced
+    # by user data leaves dangling references — a workbook that fails its own validation.
+    # Once any of the three is supplied or seeded, the others are cleared to their headers.
+    if any(t is not None for t in (dictionaries, fields, lookups)):
+        empty = pd.DataFrame()
+        dictionaries = empty if dictionaries is None else dictionaries
+        fields = empty if fields is None else fields
+        lookups = empty if lookups is None else lookups
+
+    # --- merge extendedcatalogue: metadata seed (lowest) < config (highest)
+    extended = dict(ext_seed)
+    for k, v in (cfg.get("extendedcatalogue", {}) or {}).items():
+        extended[k] = v
+    cfg = dict(cfg)
+    cfg["extendedcatalogue"] = extended
+
+    # --- validate before writing (fail fast on ERRORs; the user-attributed fields
+    # warn-and-default rather than block — see DESIGN.md). Validation sees the identifier
+    # as the user gave it, so it is the one place that reports the DOI rewrite.
+    issues = validate_inputs(tpl, cfg, dictionaries, fields, lookups)
+    _report(issues)
+    if any(sev == "ERROR" for sev, _ in issues):
+        sys.exit("Refusing to write: fix the ERROR(s) above.")
+
+    # --- normalize catalogue.identifier to a canonical DOI URL (validated above)
+    cat = dict(cfg.get("catalogue", {}) or {})
+    if str(cat.get("identifier", "")).strip():
+        canonical, _ = normalize_doi(cat["identifier"])
+        if canonical:
+            cat["identifier"] = canonical
+            cfg["catalogue"] = cat
+
+    # --- surgical write
+    edited = build_filled_workbook(tpl, cfg, dictionaries, fields, lookups)
+    write_zip(tpl.path, args.out, edited)
+
+    for w in warnings_out:
+        print(f"WARN: {w}", file=sys.stderr)
+    print(f"Wrote {args.out}", file=sys.stderr)
+    print("Review the seeded/guessed values before submitting to AD Workbench.",
+          file=sys.stderr)
+
+
+# ===========================================================================
+# Building the filled workbook (returns {sheet_file_path: new_xml})
+# ===========================================================================
+def build_filled_workbook(tpl, cfg, dictionaries, fields, lookups):
+    edited = {}
+
+    # catalogue: key in col A (rows 2..N), value in col B. Provided keys are written;
+    # unprovided keys whose template value is an ALL-CAPS placeholder are cleared, while
+    # genuine defaults (license, publisher_url, language, contactPoint, …) are kept.
+    cat = cfg.get("catalogue", {}) or {}
+    fn = tpl._sheet_filename(SHEET_CATALOGUE)
+    sx = _load_sheet(tpl, fn)
+    ws = tpl.wb[SHEET_CATALOGUE]
+    cat_modified = []
+    for r in range(2, ws.max_row + 1):
+        key = ws.cell(row=r, column=1).value
+        if not key:
+            continue
+        key = str(key).strip()
+        if key in cat:
+            val = cat[key]
+            kind = "empty" if str(val).strip() == "" else "str"
+            sx.set_cell(f"B{r}", val, kind=kind, default_style="4")
+            cat_modified.append(f"B{r}")
+        elif key in CAT_KEEP_DEFAULT_KEYS:
+            continue  # a genuine UK DRI default — keep the shipped value verbatim
+        elif is_caps_placeholder(ws.cell(row=r, column=2).value):
+            sx.set_cell(f"B{r}", "", kind="empty")
+            cat_modified.append(f"B{r}")
+    sx.drop_hyperlinks(cat_modified)  # e.g. the stale mailto: on an overwritten contactPoint
+    edited[fn] = sx.serialize()
+
+    # settings: key in col A, value in col B (boolean rows use t="b")
+    settings = cfg.get("settings", {}) or {}
+    if settings:
+        fn = tpl._sheet_filename(SHEET_SETTINGS)
+        sx = _load_sheet(tpl, fn)
+        ws = tpl.wb[SHEET_SETTINGS]
+        keymap = {str(ws.cell(row=r, column=1).value).strip(): r
+                  for r in range(2, ws.max_row + 1) if ws.cell(row=r, column=1).value}
+        bool_keys = {"allow_private_cohorts", "allow_internal_cohorts",
+                     "expose_cohort_counts", "expose_cohort_visualisations",
+                     "allow_dataset_update_subscriptions", "allow_clear",
+                     "allow_pseudonymised"}
+        for key, val in settings.items():
+            if key not in keymap:
+                continue
+            kind = "bool" if key in bool_keys else "str"
+            sx.set_cell(f"B{keymap[key]}", val, kind=kind)
+        edited[fn] = sx.serialize()
+
+    # workspace_settings: key in col B, value in col C
+    wsp = cfg.get("workspace_settings", {}) or {}
+    if wsp:
+        fn = tpl._sheet_filename(SHEET_WORKSPACE)
+        sx = _load_sheet(tpl, fn)
+        ws = tpl.wb[SHEET_WORKSPACE]
+        keymap = {str(ws.cell(row=r, column=2).value).strip(): r
+                  for r in range(2, ws.max_row + 1) if ws.cell(row=r, column=2).value}
+        for key, val in wsp.items():
+            if key not in keymap:
+                continue
+            sx.set_cell(f"C{keymap[key]}", val, kind="str", default_style=None)
+        edited[fn] = sx.serialize()
+
+    # extendedcatalogue: values in D..I per field row. Every field row is processed so
+    # that any value cell the user did not provide is cleared of its shipped example.
+    extended = cfg.get("extendedcatalogue", {}) or {}
+    fn = tpl._sheet_filename(SHEET_EXTENDED)
+    sx = _load_sheet(tpl, fn)
+    ext_modified = []
+    for f in tpl.ext_fields:
+        provided = _lookup_ci(extended, f["label"])
+        vals = as_list(provided) if provided is not None else []
+        # Organization / the Logo (URL) field default to the template value when the
+        # user provides none — leave the cell (and any hyperlink) untouched.
+        if not vals and (f["norm"] in EXT_KEEP_DEFAULT_LABELS or f["kind"] == "url"):
+            continue
+        # Dropdown values are written in the vocabulary's own casing, so a cell always
+        # satisfies its data-validation. For the sample-type field only, values the
+        # vocabulary cannot express are split off into the overflow cell.
+        overflow = []
+        if f["allowed"] is not None and vals:
+            matched, unmatched = split_by_vocab(vals, f["allowed"])
+            if f["norm"] == EXT_OVERFLOW_FIELD:
+                vals, overflow = matched, unmatched
+            elif matched:
+                vals = matched  # unmatched values are already an ERROR in validation
+        ncols = len(VALUE_COLS) if f["multi"] else 1
+        for i in range(ncols):
+            ref = f"{VALUE_COLS[i]}{f['row']}"
+            if i < len(vals):
+                kind = "num" if f["kind"] == "integer" else "str"
+                sx.set_cell(ref, vals[i], kind=kind)
+            else:
+                sx.set_cell(ref, "", kind="empty")  # clear leftover example
+            ext_modified.append(ref)
+        if f["norm"] == EXT_OVERFLOW_FIELD:
+            ref = f"{OVERFLOW_COL}{f['row']}"
+            sx.set_cell(ref, ", ".join(overflow), kind="str" if overflow else "empty")
+            ext_modified.append(ref)
+    sx.drop_hyperlinks(ext_modified)  # e.g. the example Logo link on an overwritten/cleared cell
+    edited[fn] = sx.serialize()
+
+    # schema sheets: replace example data rows with the user's rows (header kept)
+    _fill_table(tpl, edited, SHEET_DICTIONARIES, dictionaries,
+                ["code", "name", "description"],
+                {"A": "17", "B": "4", "C": "4"},
+                bool_cols=set())
+    _fill_table(tpl, edited, SHEET_FIELDS, fields,
+                ["dictionary_code", "name", "label", "type", "constraints",
+                 "description", "uri", "entity", "cohort_filter"],
+                {"A": "17", "B": "8", "C": "8", "D": "8", "E": "14",
+                 "F": "8", "G": "8", "H": None, "I": None},
+                bool_cols={"entity", "cohort_filter"})
+    _fill_table(tpl, edited, SHEET_LOOKUPS, lookups,
+                ["lookup", "name", "description", "uri"],
+                {"A": "11", "B": "19", "C": "19", "D": "19"},
+                bool_cols=set())
+    return edited
+
+
+def is_caps_placeholder(value):
+    """True for the template's ALL-CAPS placeholder cells (e.g. 'TITLE',
+    'LIST KEYWORDS', 'IDENTETIFIER') — cleared when the user provides no value. Genuine
+    defaults are mixed- or lower-case ('en', a URL, 'non-commercial use') and are kept;
+    the keys in CAT_KEEP_DEFAULT_KEYS are kept regardless of casing."""
+    if value is None:
+        return False
+    s = str(value).strip()
+    return s != "" and s == s.upper() and s != s.lower()
+
+
+def _load_sheet(tpl, fn):
+    with zipfile.ZipFile(tpl.path) as z:
+        return SheetXML(z.read(fn).decode("utf-8"))
+
+
+def _fill_table(tpl, edited, sheet_name, df, columns, col_styles, bool_cols):
+    """Replace data rows (below header row 1) of a schema sheet with df's rows.
+
+    If df is None the sheet is left untouched. If df is empty the example rows are
+    cleared, leaving just the header."""
+    if df is None:
+        return
+    fn = tpl._sheet_filename(sheet_name)
+    sx = _load_sheet(tpl, fn)
+    col_letters = [chr(ord("A") + i) for i in range(len(columns))]
+    new_rows = []
+    for _, r in df.iterrows():
+        cells = {}
+        for letter, colname in zip(col_letters, columns):
+            val = r.get(colname, "")
+            style = col_styles.get(letter)
+            if colname in bool_cols:
+                if str(val).strip() == "":
+                    continue
+                cells[letter] = ("bool", val, style)
+            else:
+                cells[letter] = ("auto", val, style)  # "" -> empty styled cell
+        new_rows.append(cells)
+    # materialize with correct row numbers
+    header_row = 1
+    built = []
+    for i, cells in enumerate(new_rows):
+        rownum = header_row + 1 + i
+        rowcells = {}
+        for letter, (kind, val, style) in cells.items():
+            ref = f"{letter}{rownum}"
+            rowcells[ref] = SheetXML.build_cell(ref, val, style=style, kind=kind)
+        built.append(rowcells)
+    sx.replace_data_rows(header_row, built)
+    edited[fn] = sx.serialize()
+
+
+# ===========================================================================
+# Repackaging the zip (copy everything verbatim, swap edited worksheet XMLs)
+# ===========================================================================
+def write_zip(src_path, out_path, edited):
+    if os.path.abspath(src_path) == os.path.abspath(out_path):
+        sys.exit("refusing to overwrite the template; choose a different --out path.")
+    tmp = out_path + ".part"
+    with zipfile.ZipFile(src_path) as zin, \
+            zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename in edited:
+                data = edited[item.filename].encode("utf-8")
+            zout.writestr(item, data)
+    os.replace(tmp, out_path)
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="addi",
+        description="Fill the UK DRI FAIR-metadata workbook for an ADDI / AD "
+                    "Workbench submission (never submits — writes files only).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_template(sp):
+        sp.add_argument("--template", default=DEFAULT_TEMPLATE,
+                        help="template .xlsx (default: shipped V1.2 workbook)")
+
+    sp = sub.add_parser("info", help="describe the template and its vocabularies")
+    add_template(sp)
+    sp.add_argument("--json", action="store_true", help="machine-readable dump")
+    sp.set_defaults(func=cmd_info)
+
+    sp = sub.add_parser("fill", help="write inputs into the template -> submission xlsx")
+    add_template(sp)
+    sp.add_argument("--config", help="JSON/YAML with catalogue/extendedcatalogue/"
+                                     "settings/workspace_settings values")
+    sp.add_argument("--metadata", help="metadata.tsv to seed dictionaries/fields/lookups "
+                                       "+ some descriptive fields (lowest precedence)")
+    sp.add_argument("--metadata-dict-code", default="sample_metadata",
+                    help="dictionary code for the metadata-seeded table")
+    sp.add_argument("--assay", action="append", metavar="ASSAY[=DESCRIPTION]",
+                    help="technology of the uploaded counts file -> a counts_data "
+                         "dictionary row. Repeatable, or a comma-separated list. Known: "
+                         "scRNAseq, bulk RNAseq, proteomics, spatial transcriptomics; any "
+                         "other label is accepted with a generic description")
+    sp.add_argument("--lookup-max-values", type=int, default=20,
+                    help="max distinct values for a metadata.tsv text column to become "
+                         "a lookup (default 20)")
+    sp.add_argument("--dictionaries", help="dictionaries table (TSV/CSV)")
+    sp.add_argument("--fields", help="fields table (TSV/CSV)")
+    sp.add_argument("--lookups", help="lookups table (TSV/CSV)")
+    sp.add_argument("--out", default="UK_DRI_FAIR_Metadata_filled.xlsx",
+                    help="output workbook path")
+    sp.set_defaults(func=cmd_fill)
+
+    sp = sub.add_parser("validate", help="check inputs or a filled workbook")
+    add_template(sp)
+    sp.add_argument("--workbook", help="a filled .xlsx to validate (instead of inputs)")
+    sp.add_argument("--config", help="JSON/YAML config to validate")
+    sp.add_argument("--dictionaries", help="dictionaries table (TSV/CSV)")
+    sp.add_argument("--fields", help="fields table (TSV/CSV)")
+    sp.add_argument("--lookups", help="lookups table (TSV/CSV)")
+    sp.set_defaults(func=cmd_validate)
+
+    args = p.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
