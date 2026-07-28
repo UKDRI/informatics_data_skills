@@ -243,12 +243,45 @@ in place (see *addi* below).
     variable: `dictionary_code`, `name`, `label`, `type`, `constraints`→lookup,
     `description`, `uri`, `entity`, `cohort_filter`), and `lookups` (the enumerated
     value sets referenced by `fields.constraints`).
+- **Two `catalogue` keys carry non-obvious rules:**
+  - `identifier` — **a DOI, or blank.** Accepted input forms are the bare DOI
+    (`10.5281/zenodo.123456`), the `doi:`-prefixed form, and the resolver URL
+    (`https://doi.org/10.…`); the skill **normalizes to the canonical
+    `https://doi.org/10.…`** and emits a `WARN` naming the rewrite. Any non-DOI value —
+    a repository accession such as `GSE123456`, a bare non-DOI URL, free text — is an
+    **ERROR**: the field is for a citable dataset DOI, not the source accession. When the
+    user supplies nothing, the template's ALL-CAPS `IDENTETIFIER` placeholder is cleared
+    and the cell left empty (the existing `is_caps_placeholder` path).
+  - `accessRights` — **optional; blank is valid.** No vocabulary is enforced (the field is
+    free text in the template). The shipped `non-commercial use` is a genuine UK DRI
+    default rather than an example placeholder, so it is kept when the user supplies no
+    value and overwritten when they do.
 - **Controlled vocabularies live in the hidden `Catalogue_Data` sheet** and are wired
   into the `extendedcatalogue` dropdowns via list data-validations (col A Study Data
   Language, B Diseases, C Study Types, D Biomarkers, E participant countries, F sample
   types, G Data Types, plus Federated-results and Access-Level columns). The skill
   **reads these from the template** rather than hardcoding them, so it never drifts
   from the shipped file.
+- **One dropdown has an overflow cell (`J16`).** *Type of Sample From Which Data Were
+  Derived (Multi-select)* (row 16, vocab `Catalogue_Data!F2:F12` — 11 terms: Blood, Brain
+  tissue, CSF, DNA (Genomic), Stool, iPSC, Peripheral blood, Plasma, RNA (Genomic), Serum
+  from blood, Urine) is seeded from the `metadata.tsv` `tissue` column (falling back to
+  `sample_type` / `source_name` when present). Each distinct value is matched
+  case-insensitively against that vocabulary and the matches are written to
+  `Value1..Value6` (`D..I`) like any other multi-select.
+  - A value matching **no** vocabulary term is **not an ERROR for this one field**.
+    Instead the skill (a) **tells the user** — a `WARN` naming the unmatched value(s)
+    alongside the 11 allowed terms — and (b) writes the proposed new term into **`J16`**,
+    the first cell past `Value6`, which carries neither a data-validation nor a fill.
+    Several unmatched values are comma-separated into that single cell.
+  - `J16` is **exempt from vocabulary validation** in both `validate --config` and
+    `validate --workbook`. A filled workbook with a non-empty `J16` yields a `WARN`
+    ("proposed sample type outside the template vocabulary — confirm with ADDI before
+    submitting"), never an ERROR.
+  - The exemption is **deliberately scoped to row 16**. Every other dropdown (Study Data
+    Language, Diseases, Study Types, Biomarkers, participant countries, Data Types) still
+    hard-ERRORs on an out-of-vocabulary value: none of them has a free cell beside its
+    Value columns, and the portal offers no channel for a proposal there.
 - **Subcommands** (following the shared verb style):
   - `info` — describe the template: list its sheets, the mandatory fields
     (`catalogue` title/description/publisher_name; the `*`-marked `extendedcatalogue`
@@ -257,58 +290,99 @@ in place (see *addi* below).
   - `fill` — the core generator. Loads the template and writes user-supplied values
     into the exact cells, **preserving all dropdowns, prompts, colors, and the hidden
     vocab sheet**, then saves to `--out`. Inputs, in **increasing precedence**: an
-    optional `--metadata metadata.tsv` seeds the schema (one `fields` row per column,
-    `type` inferred) and descriptive catalogue / extendedcatalogue values (see below);
+    optional `--metadata metadata.tsv` seeds all three schema tables (one `fields` row per
+    column with `type` inferred, plus `lookups` from the categorical columns' unique
+    values) and descriptive catalogue / extendedcatalogue values (see below);
     a JSON/YAML `--config` supplies scalar catalogue / extendedcatalogue / settings
     values; and `--dictionaries` / `--fields` / `--lookups` (TSV or CSV, read with
     pandas) give the schema tables explicitly. Where they overlap, the explicit
     `--config` / `--dictionaries` / `--fields` / `--lookups` values override anything
-    seeded from `--metadata`; the always-required user-attributed fields (below) come
-    from `--config` (or an interactive prompt), never from `--metadata`. Multi-select
-    (green) fields spread their values across the Value1..Value6 columns (**max 6**);
-    single-value fields write only Value1 (col D); grey cells are never written. The
+    seeded from `--metadata`; the user-attributed fields (below) come from `--config` (or
+    an interactive prompt) or fall back to the template's UK DRI default — never to
+    anything read from `--metadata`. Multi-select (green) fields spread their values across
+    the Value1..Value6 columns (**max 6**); single-value fields write only Value1 (col D);
+    grey cells are never written. The
     template ships **pre-filled with example values** (`TITLE`/`DESCRIPTION`/…
     placeholders, sample dropdown selections) — `fill` overwrites placeholders and
     clears leftover examples so the output carries only user data. The exceptions are
-    a few cells holding a genuine UK DRI **default** rather than an example: the
-    `catalogue` `license`/`publisher_*`/`language`/`contactPoint` defaults, and the
-    `extendedcatalogue` `Organization` and Logo (`URL`) fields — these are kept when
-    the user provides no value, and cleared/overwritten only when the user does.
+    the cells holding a genuine UK DRI **default** rather than an example: the `catalogue`
+    `license`/`publisher_*`/`language`/`contactPoint`/`creator`/`accessRights` defaults,
+    the `workspace_settings` `dataset owners` default, and the `extendedcatalogue`
+    `Organization` and Logo (`URL`) fields — these are kept when the user provides no
+    value, and cleared/overwritten only when the user does. (The `workspace_settings`
+    block only ever writes keys the user supplied, so its default survives implicitly;
+    it is listed here so that behaviour is not mistaken for an oversight and "fixed" into
+    a clear.)
   - `validate` — check a filled workbook (or the inputs) against the template's rules
     without submitting.
   - All three commands accept `--template PATH` to target a different template file
     (default: the shipped V1.2 workbook).
 - **Rules enforced** (from the README sheet + the embedded data-validations):
   mandatory fields present (the README's `title`/`description`/`publisher_name` and
-  the `*`-marked `extendedcatalogue` fields, plus the always-required user-attributed
-  fields below); dropdown values ∈ the `Catalogue_Data` vocab; `visibility`
+  the `*`-marked `extendedcatalogue` fields); `identifier` is DOI-shaped or blank, while
+  `accessRights` is unconstrained and may be blank; the user-attributed fields below are
+  *warn-and-default*, not blocking; dropdown values ∈ the `Catalogue_Data` vocab (the sole
+  exception being the row-16 sample-type overflow into `J16`, above); `visibility`
   ∈ {private, internal}; catalogue/dictionary `code` = letters/numbers/underscore
   (dictionary `code` and field `name` additionally must not start with a number);
   field `type` ∈ {boolean, date, datetime, decimal, integer, text, time}; boolean
   fields carry no constraints; `fields.dictionary_code` resolves to a
   `dictionaries.code`; `fields.constraints` / `lookups.lookup` cross-reference;
   keywords comma-separated.
-- **User-attributed fields are always required from the user.** `creator`
-  (catalogue), `dataset owners` (workspace_settings), and `contactPoint` (catalogue)
-  identify the people and party responsible for the dataset. The template's README
-  marks only `title`/`description`/`publisher_name` as mandatory, but `addi` adds
-  these three as a deliberate **exception to (addition beyond) the README's mandatory
-  set**: they must always be filled from user-provided input, and the skill will not
-  write the workbook until it has all three. The skill (and the agent driving it) must
-  **never guess, infer, or auto-fill them** from the environment, the git identity,
-  the user's email, or any prior context; if the user has not supplied all three,
-  **ask for them before filling** rather than falling back to a default. In
-  particular, the template's shared-org `contactPoint` placeholder
-  (`ukdri-informatics@ukdri.ac.uk`) is **not** consent to keep or reuse it, and the
-  user's personal email is never substituted in — this is the *No unsolicited
-  credentials* rule applied to authorship/contact fields. `publisher_*` are ordinary
-  defaults and may be kept unless the user overrides them.
+- **User-attributed fields default to UK DRI and must be confirmed.** `creator`
+  (catalogue), `contactPoint` (catalogue), and `dataset owners` (workspace_settings)
+  identify the people and party responsible for the dataset. Each may be **left blank by
+  the user**, in which case it falls back to the value the template ships —
+  `UK Dementia Research Institute`, `ukdri-informatics@ukdri.ac.uk`, and
+  `UK Dementia Research Institute` respectively.
+  - Their absence **does not block the write**: `validate` reports them as a `WARN`
+    ("kept the template's UK DRI default — confirm or override"), not an ERROR, and `fill`
+    proceeds.
+  - The agent driving the skill **must ask the user whether these should be changed**
+    before filling, and must state which defaults it kept. Silently shipping the
+    institutional default without telling the user is the failure mode to avoid.
+  - **Never guess a person.** These fields must never be derived from the environment, the
+    git identity, the user's own email address, or any prior context. The *only* permitted
+    fallback is the template's own institutional value. In particular the user's personal
+    address is never substituted into `contactPoint`; the shared-org placeholder
+    (`ukdri-informatics@ukdri.ac.uk`) is the fallback precisely because it is an
+    org-level, non-personal address. This remains the *No unsolicited credentials* rule
+    applied to authorship/contact fields — what changed is the failure mode (warn plus
+    institutional default instead of a hard stop), not any licence to infer.
+  - `publisher_*` are ordinary defaults and may be kept unless the user overrides them.
 - **Inputs are typically derived from a pre-generated `metadata.tsv`.** The normal
   workflow first runs one of the repository skills' `metadata-table` command (see
   below) to obtain the harmonized `metadata.tsv` for the study, then feeds it to
-  `addi` (e.g. `fill --metadata metadata.tsv`) so the dictionary/fields and
-  descriptive catalogue values are seeded from that table rather than typed by hand.
-  The user-attributed fields above still come from the user, never from the table.
+  `addi` (e.g. `fill --metadata metadata.tsv`) so the data dictionary and descriptive
+  catalogue values are seeded from that table rather than typed by hand. The
+  user-attributed fields above are never taken from the table.
+- **The data dictionary is seeded from the `metadata.tsv` columns and their unique
+  values** — all three schema tables, not just two:
+  - **`dictionaries`** — one row for the table: `code` = `--metadata-dict-code`
+    (default `sample_metadata`), `name` = the title-cased code, `description` =
+    `Seeded from <basename>`.
+  - **`fields`** — one row per column: `name` sanitised to the `code` charset, `label` =
+    the original column header, `type` inferred from the column's values, and
+    `constraints` set to the column's lookup name when the column qualifies as
+    categorical (below).
+  - **`lookups`** — the enumerated value sets, **derived from each categorical column's
+    unique values**. A column qualifies when *all* of these hold: its inferred `type` is
+    `text` (numeric and date columns never become lookups); its distinct non-`NA` values
+    number between 2 and `--lookup-max-values` (default 20); that distinct count is
+    strictly less than the row count (which excludes per-row free text); and it is not an
+    identifier column (`sample`, `sample_id`, `id`, `replicate`). The lookup name is the
+    sanitised column name upper-cased (`condition` → `CONDITION`), matching the template's
+    own `SEX` / `APOE_GENOTYPE` examples. One `lookups` row per distinct value: `lookup` =
+    that name, `name` = the observed value verbatim, `description` = the same, `uri` blank.
+    `NA` is never emitted as a value. Lookup *values* are free text — the `code`/`name`
+    charset rule applies to `fields.name`, not `lookups.name` (the template itself ships
+    `e2/e2`).
+  - Every seeded lookup, and every `constraints` assignment that follows from one, is
+    reported as a `WARN`: an enumeration recovered this way is only as complete as the rows
+    present in that one `metadata.tsv`.
+  - **Precedence is unchanged and now covers lookups:** `--metadata` (lowest) < `--config`
+    < explicit `--dictionaries` / `--fields` / `--lookups`. An explicit `--lookups`
+    replaces the seeded set wholesale rather than merging into it.
 - **Generate, don't submit** — `fill` writes the workbook only; the skill never
   uploads to AD Workbench (mirrors `sra` and the download-script generators).
 
@@ -511,6 +585,18 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
     duplicate (and risk drifting from) the validations the template already encodes.
     This — not convenience — is why `addi` is the one skill permitted third-party
     dependencies. It is the xlsx analog of `sra`'s `__TOKEN__` substitution.
+11. **Warn-and-default over refuse-to-write; a proposal cell over a hard reject
+    (`addi`)** — two conditions that once blocked the workbook now yield a warned default
+    instead. The UK DRI authorship/contact fields (`creator`, `contactPoint`,
+    `dataset owners`) fall back to the template's institutional value, and a sample type
+    the template's 11-term vocabulary cannot express goes into `J16`. Both blocks were
+    expensive in the common case — a UK DRI dataset submitted by a UK DRI author, carrying
+    a tissue the ADDI vocabulary predates — and neither is a correctness risk the way a
+    malformed `code` or `type` is: the institutional default is genuinely the right answer
+    most of the time, and `J16` sits outside every data-validation range, so a proposed
+    term cannot corrupt a dropdown. The safety property deliberately kept is **never guess
+    a person**: the fallback is always the *template's* own institutional value, never
+    anything inferred from the environment or the user's identity.
 
 ## Verified endpoint reference
 
@@ -561,3 +647,11 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
   hub-specific settings — notably which `workflow_key` Data Access Requests are
   enabled on the target hub (README note 2) — which must be checked against that hub.
   Multi-select fields are capped at the template's **six** Value columns.
+- **`addi`'s `J16` is a proposal, not a portal field.** It sits outside every
+  data-validation range precisely so a new sample type can be recorded, but nothing
+  guarantees the ADDI importer reads it — a genuinely new *Type of Sample* term still has
+  to be raised with ADDI to enter the controlled vocabulary.
+- **`addi` lookups seeded from a `metadata.tsv` are incomplete by construction.** They
+  capture only the values present in that table, so a study whose true value set is wider
+  than the sample sheet will produce an under-specified enumeration; the seeded rows are
+  a reviewable starting point (each is `WARN`ed), not the authoritative value set.
