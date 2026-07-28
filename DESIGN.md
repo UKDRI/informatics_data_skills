@@ -283,25 +283,24 @@ in place (see *addi* below).
     hard-ERRORs on an out-of-vocabulary value: none of them has a free cell beside its
     Value columns, and the portal offers no channel for a proposal there.
 - **Subcommands** (following the shared verb style):
-  - `info` — describe the template: list its sheets, the mandatory fields
-    (`catalogue` title/description/publisher_name; the `*`-marked `extendedcatalogue`
-    fields), and dump each dropdown's allowed values (`--json` for machine output).
-    Lets an agent discover valid inputs before filling.
+  - `info` — describe the template: its sheets; the mandatory fields (`catalogue`
+    title/description/publisher_name; the `*`-marked `extendedcatalogue` fields); the
+    `identifier`/`accessRights` rules; the responsible-party fields with the defaults that
+    would be kept; the sample-type overflow cell; the allowed `--assay` values and the
+    description each produces; and every dropdown's allowed values (`--json` for machine
+    output). Everything is read from the template, so `info` is how an agent discovers valid
+    inputs before filling.
   - `fill` — the core generator. Loads the template and writes user-supplied values
     into the exact cells, **preserving all dropdowns, prompts, colors, and the hidden
-    vocab sheet**, then saves to `--out`. Inputs, in **increasing precedence**: an
-    optional `--metadata metadata.tsv` seeds all three schema tables (one `fields` row per
-    column with `type` inferred, plus `lookups` from the categorical columns' unique
-    values) and descriptive catalogue / extendedcatalogue values (see below);
-    a JSON/YAML `--config` supplies scalar catalogue / extendedcatalogue / settings
-    values; and `--dictionaries` / `--fields` / `--lookups` (TSV or CSV, read with
-    pandas) give the schema tables explicitly. Where they overlap, the explicit
-    `--config` / `--dictionaries` / `--fields` / `--lookups` values override anything
-    seeded from `--metadata`; the user-attributed fields (below) come from `--config` (or
-    an interactive prompt) or fall back to the template's UK DRI default — never to
-    anything read from `--metadata`. Multi-select (green) fields spread their values across
-    the Value1..Value6 columns (**max 6**); single-value fields write only Value1 (col D);
-    grey cells are never written. The
+    vocab sheet**, then saves to `--out`. Its inputs are an optional
+    `--metadata metadata.tsv` (seeds all three schema tables plus descriptive catalogue /
+    extendedcatalogue values), a JSON/YAML `--config` (scalar catalogue /
+    extendedcatalogue / settings / workspace_settings values), `--assay` (the `counts_data`
+    dictionary row for the uploaded counts file), and `--dictionaries` / `--fields` /
+    `--lookups` (TSV or CSV, read with pandas — the schema tables given explicitly). How
+    they combine is one rule, stated once under *Input precedence* below. Multi-select
+    (green) fields spread their values across the Value1..Value6 columns (**max 6**);
+    single-value fields write only Value1 (col D); grey cells are never written. The
     template ships **pre-filled with example values** (`TITLE`/`DESCRIPTION`/…
     placeholders, sample dropdown selections) — `fill` overwrites placeholders and
     clears leftover examples so the output carries only user data. The exceptions are
@@ -317,14 +316,35 @@ in place (see *addi* below).
     without submitting.
   - All three commands accept `--template PATH` to target a different template file
     (default: the shipped V1.2 workbook).
+- **Input precedence** — stated here once; the bullets below describe *what* each input
+  produces, not how conflicts resolve.
+  - **Overriding inputs, in increasing precedence:** `--metadata` (lowest) < `--config` <
+    explicit `--dictionaries` / `--fields` / `--lookups`. Where two of them set the same
+    thing the later one wins outright: an explicit `--lookups` replaces a seeded lookup set
+    wholesale rather than merging into it, and `--config` beats any descriptive value
+    seeded from `--metadata`.
+  - **`--assay` is additive, not a precedence level.** It contributes `counts_data`
+    dictionary row(s) that are *appended* to whatever `--metadata` seeded — the two never
+    compete, because they describe different things (the uploaded counts file vs the sample
+    annotation table). Only `--dictionaries` displaces them, since it replaces that sheet
+    entirely.
+  - **Two things are never read out of `--metadata`:** the user-attributed fields (below),
+    which come from `--config` or an interactive prompt and otherwise fall back to the
+    template's UK DRI default; and the assay, which comes from the user. A harmonized
+    sample table is evidence about samples — never about who is responsible for the dataset
+    or what was uploaded.
 - **Rules enforced** (from the README sheet + the embedded data-validations):
   mandatory fields present (the README's `title`/`description`/`publisher_name` and
   the `*`-marked `extendedcatalogue` fields); `identifier` is DOI-shaped or blank, while
   `accessRights` is unconstrained and may be blank; the user-attributed fields below are
   *warn-and-default*, not blocking; dropdown values ∈ the `Catalogue_Data` vocab (the sole
   exception being the row-16 sample-type overflow into `J16`, above); `visibility`
-  ∈ {private, internal}; catalogue/dictionary `code` = letters/numbers/underscore
-  (dictionary `code` and field `name` additionally must not start with a number);
+  ∈ {private, internal}; `--assay` ∈ {scrna, bulk, proteomics, spatial};
+  catalogue/dictionary `code` = letters/numbers/underscore (dictionary `code` and field
+  `name` additionally must not start with a number); `dictionaries.code` values are
+  **unique within the sheet** — it is the key `fields.dictionary_code` resolves against, so
+  a duplicate would silently merge two tables (this is what the `counts_data_<assay>`
+  suffixing exists to avoid);
   field `type` ∈ {boolean, date, datetime, decimal, integer, text, time}; boolean
   fields carry no constraints; `fields.dictionary_code` resolves to a
   `dictionaries.code`; `fields.constraints` / `lookups.lookup` cross-reference;
@@ -379,10 +399,52 @@ in place (see *addi* below).
     `e2/e2`).
   - Every seeded lookup, and every `constraints` assignment that follows from one, is
     reported as a `WARN`: an enumeration recovered this way is only as complete as the rows
-    present in that one `metadata.tsv`.
-  - **Precedence is unchanged and now covers lookups:** `--metadata` (lowest) < `--config`
-    < explicit `--dictionaries` / `--fields` / `--lookups`. An explicit `--lookups`
-    replaces the seeded set wholesale rather than merging into it.
+    present in that one `metadata.tsv`. All three seeded tables sit at the bottom of the
+    precedence order above.
+- **The uploaded counts file gets its own `dictionaries` row, selected by `--assay`.** A
+  submission uploads a processed counts file alongside the sample annotation, and its
+  *form* depends on the technology:
+
+  | `--assay` | `code` / `name` | `description` |
+  |-----------|-----------------|---------------|
+  | `scrna` | `counts_data` | `Processed counts data anndata object file` |
+  | `bulk` | `counts_data` | `Processed counts matrix file` |
+  | `proteomics` | `counts_data` | `Processed counts matrix file` |
+  | `spatial` | `counts_data` | `Processed counts SpatialData .zarr` |
+
+  - `code` and `name` are both the literal `counts_data` — not title-cased, unlike the
+    metadata-seeded row. The row carries **no `fields` rows**: it describes a *file*, not a
+    table of variables. This mirrors the template's own shipped `imaging` / `imaging` /
+    "Imaging data files for participants" row, which likewise has no `fields` entries, and
+    needs no validation change (`fields.dictionary_code` must resolve to a
+    `dictionaries.code`, never the reverse).
+  - `--assay` takes one of the four values or a comma-separated list of them
+    (`--assay scrna,proteomics`). The first assay takes the bare `counts_data` code and
+    each subsequent one is suffixed with its assay name (`counts_data_proteomics`), because
+    `dictionaries.code` must be unique within the sheet. Repeated values are de-duplicated;
+    an unrecognised value is an **ERROR** listing the four allowed ones.
+  - Two consequences of that scheme, both deliberate: which assay wins the bare
+    `counts_data` code is **positional**, not self-describing — accepted so that the common
+    single-assay case yields exactly the `counts_data` code the submission expects; and
+    `bulk` and `proteomics` share one description, so `--assay bulk,proteomics` produces two
+    rows differing only in `code`. That is correct — they are two separately uploaded files
+    of the same form.
+  - A typical run therefore yields `sample_metadata` (the annotation table, with its fields
+    and lookups) plus `counts_data` (the uploaded file). `--assay` also works alone: with no
+    `--metadata` the `dictionaries` sheet holds only the `counts_data` row(s). See *Input
+    precedence* above for how it combines with the other inputs.
+  - **The assay must come from the user; it is never derived from the data.** It is not a
+    column of `metadata.tsv` and cannot be guessed from the columns that are there, so the
+    agent driving the skill **asks the user which technology the submission covers — or uses
+    the answer they already gave earlier in the conversation** — before filling. When
+    `--assay` is absent the skill writes **no** `counts_data` row and says so with a `WARN`;
+    there is no institutional default to fall back on, unlike the responsible-party fields.
+  - Note the deliberate difference from those fields: for them, something merely *present*
+    in the environment or prior context is **not** consent, because getting a person wrong
+    misattributes work. The assay is a factual property of the submission that only the
+    submitter knows, so the user having stated it earlier in the conversation *is* them
+    supplying it. What is forbidden in both cases is the same: inventing the value from
+    the data or the environment.
 - **Generate, don't submit** — `fill` writes the workbook only; the skill never
   uploads to AD Workbench (mirrors `sra` and the download-script generators).
 
@@ -464,6 +526,10 @@ bulk, because it cannot be reliably inferred from the metadata:
   by subsampling), since the archives do not expose per-run strandedness.
 
 One row per run; rows sharing a `sample` value are concatenated by the pipeline.
+
+`addi` reuses the flag *name* with a **wider value set** (adding `proteomics` and
+`spatial`) and a different job: there it selects the `counts_data` file-type
+**description**, not a sample-sheet format. The two are deliberately not interchangeable.
 
 - **Pairing**: R1/R2 detected from filename (`_1`/`_2`, `R1`/`R2`); index reads
   (`_I1`, `_R3`, `_3`) are dropped; falls back to positional order.
@@ -651,6 +717,10 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
   data-validation range precisely so a new sample type can be recorded, but nothing
   guarantees the ADDI importer reads it — a genuinely new *Type of Sample* term still has
   to be raised with ADDI to enter the controlled vocabulary.
+- **`addi`'s `counts_data` row describes the file, not its contents.** It deliberately
+  carries no `fields` rows (matching the template's `imaging` row), so the portal gets no
+  column-level schema for the uploaded counts object and a reviewer cannot see inside it
+  from the workbook alone. Supply an explicit `--fields` table if that detail is wanted.
 - **`addi` lookups seeded from a `metadata.tsv` are incomplete by construction.** They
   capture only the values present in that table, so a study whose true value set is wider
   than the sample sheet will produce an under-specified enumeration; the seeded rows are
