@@ -75,13 +75,20 @@ python scripts/addi.py info --json       # full machine-readable dump (all allow
 ```
 
 Lists the sheets, the mandatory catalogue fields, the responsible-party fields with the
-defaults that would be kept, the sample-type overflow cell, every `extendedcatalogue`
-field (mandatory/kind/multi-select) and each dropdown's full allowed-value list. Run this
-first to learn valid inputs.
+defaults that would be kept, the sample-type overflow cell, the recognised `--assay` labels
+with the code and description each produces, every `extendedcatalogue` field
+(mandatory/kind/multi-select) and each dropdown's full allowed-value list. Run this first to
+learn valid inputs.
 
 ### `fill` — write a submission workbook
 
 ```bash
+python scripts/addi.py fill \
+    --config catalogue.json \
+    --metadata metadata.tsv --assay scRNAseq \
+    --out UK_DRI_FAIR_Metadata_filled.xlsx
+
+# or with the schema tables given explicitly
 python scripts/addi.py fill \
     --config catalogue.json \
     --dictionaries dicts.tsv --fields fields.tsv --lookups lookups.tsv \
@@ -159,10 +166,42 @@ The data-dictionary tables. Column headers match the template sheets:
 - **lookups**: `lookup, name, description, uri`
 
 Providing a table (even an empty one, header only) replaces the template's example rows.
-**Omitting a table leaves that sheet untouched — the template's `test_demographics` /
-`SEX` example rows stay in the output**, so pass every sheet you care about, or seed them
-from `--metadata`. `type` must be one of `boolean, date, datetime, decimal, integer, text,
-time`; `entity`/`cohort_filter` are booleans; `constraints` references a `lookups.lookup`.
+**The three sheets stand or fall together:** once any one of them is supplied — or seeded
+from `--metadata` or `--assay` — the other two are cleared to their headers, because the
+template's example rows cross-reference each other and a half-replaced set would leave
+dangling references. Supplying none of the three leaves all the example rows in place.
+`type` must be one of `boolean, date, datetime, decimal, integer, text, time`;
+`entity`/`cohort_filter` are booleans; `constraints` references a `lookups.lookup`;
+`code` values must be unique within `dictionaries`.
+
+### `--assay` — the uploaded counts file
+
+Adds a `counts_data_<assay>` row to `dictionaries` describing the processed counts file the
+submission uploads. **The assay is not in `metadata.tsv` and is never inferred — ask the
+user which technology (or technologies) the submission covers** if they have not said.
+
+| `--assay` (any of these spellings) | `code` / `name` | `description` |
+|------------------------------------|-----------------|---------------|
+| `scRNAseq`, `scrna`, `single-cell RNAseq` | `counts_data_scrnaseq` | Processed counts data anndata object file |
+| `bulk RNAseq`, `bulk`, `rnaseq` | `counts_data_bulk_rnaseq` | Processed counts matrix file |
+| `proteomics` | `counts_data_proteomics` | Processed counts matrix file |
+| `spatial transcriptomics`, `spatial`, `visium` | `counts_data_spatial_transcriptomics` | Processed counts SpatialData .zarr |
+
+```bash
+python scripts/addi.py fill --config c.json --metadata metadata.tsv \
+    --assay scRNAseq --assay proteomics --out filled.xlsx
+```
+
+- **Any other label is accepted** — the list is open. An unrecognised label gets
+  `counts_data_<label>` with the generic description `Processed counts data file` and a
+  `WARN`; pass `--assay 'lipidomics=Processed lipid counts matrix file'` to set the
+  description yourself (that form also lets a description contain a comma).
+- **Repeatable, or comma-separated** (`--assay scrna,proteomics`). Aliases of the same
+  assay are de-duplicated, and codes never depend on the order given.
+- The rows are **appended** to whatever `--metadata` seeded. An explicit `--dictionaries`
+  replaces the sheet, so the rows are dropped (with a `WARN`).
+- Omitting `--assay` writes no such row and warns — the row carries **no `fields` rows** by
+  design, mirroring the template's `imaging` row, so it describes the file, not its columns.
 
 ### `--metadata metadata.tsv` (optional, lowest precedence)
 
@@ -215,6 +254,8 @@ ADDI. Every *other* dropdown still hard-errors on an out-of-vocabulary value.
   (except the row-16 sample-type overflow into `J16`, which only `WARN`s);
   multi-selects ≤ 6; single fields single-valued; integer fields numeric
 - `settings.visibility` ∈ {private, internal} (README note 1)
+- `dictionaries.code` unique within the sheet — a duplicate silently merges two tables
+- `--assay` labels are unrestricted: an unrecognised one is a `WARN`, never an ERROR
 - dictionary `code` / field `name` = letters/numbers/underscore, not starting with a
   number (README notes 3, 8, 10); field `type` ∈ the allowed set (11); boolean fields
   carry no constraints (12); `fields.dictionary_code` resolves to a `dictionaries.code`
@@ -229,6 +270,7 @@ ADDI. Every *other* dropdown still hard-errors on an out-of-vocabulary value.
 | `--config` | fill/validate | JSON/YAML scalar values |
 | `--dictionaries`/`--fields`/`--lookups` | fill/validate | schema tables (TSV/CSV) |
 | `--metadata` | fill | seed dictionaries/fields/lookups from a metadata.tsv (lowest precedence) |
+| `--assay` | fill | technology of the uploaded counts file → a `counts_data_<assay>` row (repeatable) |
 | `--metadata-dict-code` | fill | dictionary code for the metadata-seeded table (`sample_metadata`) |
 | `--lookup-max-values` | fill | max distinct values for a column to become a lookup (`20`) |
 | `--out` | fill | output workbook (`UK_DRI_FAIR_Metadata_filled.xlsx`) |
@@ -239,8 +281,11 @@ ADDI. Every *other* dropdown still hard-errors on an out-of-vocabulary value.
 - **Never submits.** The skill writes the workbook; upload to AD Workbench is manual.
 - **Dropdown values are written in the vocabulary's own casing**, so `"diseases":
   ["dementia"]` lands in the cell as `Dementia` and satisfies the data-validation.
-- **Report every `WARN` to the user** — kept defaults, seeded lookups, a `J16` proposal and
-  a normalized DOI are all things they need to confirm before submitting.
+- **Report every `WARN` to the user** — kept defaults, seeded lookups, a `J16` proposal, a
+  normalized DOI and a generic assay description are all things they need to confirm before
+  submitting.
+- **The assay→code/description mapping lives in the skill**, not the template — it is the
+  one thing `info` reports that a newer `--template` cannot resync.
 - **`workflow_key` is hub-specific.** Which Data Access Requests are enabled depends on
   the target hub (README note 2) and cannot be verified here — confirm it against the hub.
 - **A newer portal template** (V1.3+) may add fields or values: point `--template` at the

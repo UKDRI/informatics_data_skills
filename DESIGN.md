@@ -316,6 +316,13 @@ in place (see *addi* below).
     block only ever writes keys the user supplied, so its default survives implicitly;
     it is listed here so that behaviour is not mistaken for an oversight and "fixed" into
     a clear.)
+    **The three schema sheets stand or fall together.** The template's example rows
+    cross-reference each other (`fields.dictionary_code` → `test_demographics`,
+    `fields.constraints` → `SEX`), so keeping one sheet's examples while another is replaced
+    by user data would leave dangling references — a workbook that fails `addi`'s own
+    `validate`. Once any of `dictionaries` / `fields` / `lookups` is supplied or seeded, the
+    other two are cleared to their headers. Supplying none of the three leaves all the
+    example rows in place, which is at least self-consistent.
   - `validate` — check a filled workbook (or the inputs) against the template's rules
     without submitting.
   - All three commands accept `--template PATH` to target a different template file

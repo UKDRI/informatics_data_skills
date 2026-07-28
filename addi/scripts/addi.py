@@ -83,6 +83,25 @@ USER_ATTRIBUTED = [
 # settings.visibility allowed values per README note (1).
 VISIBILITY_ALLOWED = ["private", "internal"]
 
+# --assay → the `dictionaries` row describing the uploaded processed-counts file, as
+# (canonical code suffix, description, accepted spellings). The set is deliberately **open**
+# (see DESIGN.md): an unrecognised label is accepted with GENERIC_COUNTS_DESCRIPTION and a
+# WARN, never an ERROR. Every code is COUNTS_CODE_PREFIX + '_' + a suffix — there is no bare
+# `counts_data`. This mapping is the skill's own knowledge, not the template's — the one
+# thing `info` reports that a newer template cannot resync.
+ASSAY_COUNTS = [
+    ("scrnaseq", "Processed counts data anndata object file",
+     ("scRNAseq", "scrna", "single-cell RNAseq")),
+    ("bulk_rnaseq", "Processed counts matrix file",
+     ("bulk RNAseq", "bulk", "rnaseq")),
+    ("proteomics", "Processed counts matrix file",
+     ("proteomics",)),
+    ("spatial_transcriptomics", "Processed counts SpatialData .zarr",
+     ("spatial transcriptomics", "spatial", "visium")),
+]
+GENERIC_COUNTS_DESCRIPTION = "Processed counts data file"
+COUNTS_CODE_PREFIX = "counts_data"
+
 # fields.type allowed values per README note (11).
 FIELD_TYPES = ["boolean", "date", "datetime", "decimal", "integer", "text", "time"]
 
@@ -591,6 +610,87 @@ def sanitize_name(col):
     return name
 
 
+def normalize_assay(label):
+    """Match key for an assay label: lower-cased with non-alphanumerics dropped, so
+    'scRNAseq', 'scrna' and 'single-cell RNAseq' collapse toward the same entry."""
+    return re.sub(r"[^a-z0-9]+", "", str(label).lower())
+
+
+ASSAY_LOOKUP = {normalize_assay(sp): (suffix, desc)
+                for suffix, desc, spellings in ASSAY_COUNTS for sp in spellings}
+
+
+def assay_suffix(label):
+    """Code suffix for an unrecognised assay label: lower-cased, runs of non-alphanumerics
+    collapsed to one underscore, trimmed. Returns '' when the label yields nothing usable
+    (e.g. '???'), which sends the caller to the positional fallback."""
+    return re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_")
+
+
+def parse_assay_args(values):
+    """Flatten repeated --assay values into [(label, description or None)].
+
+    A value carrying an explicit `label=description` is taken whole, so a description may
+    contain commas; any other value may be a comma-separated list of labels.
+    """
+    out = []
+    for raw in values or []:
+        parts = [raw] if "=" in raw else str(raw).split(",")
+        for part in parts:
+            label, sep, desc = part.partition("=")
+            label = label.strip()
+            if label:
+                out.append((label, desc.strip() if sep else None))
+    return out
+
+
+def counts_data_rows(assay_values, existing_codes, warn):
+    """Build the counts_data dictionary rows for --assay (see DESIGN.md).
+
+    `existing_codes` is every code already in the dictionaries table, so a candidate can be
+    checked against the whole sheet rather than only against its siblings. No input
+    combination can yield a duplicate code, and no label is ever an ERROR.
+    """
+    taken = {str(c).strip() for c in existing_codes}
+    rows, seen, counter = [], {}, 0
+    for label, given_desc in parse_assay_args(assay_values):
+        known = ASSAY_LOOKUP.get(normalize_assay(label))
+        if known:
+            suffix, description = known[0], given_desc or known[1]
+        else:
+            suffix, description = assay_suffix(label), given_desc or GENERIC_COUNTS_DESCRIPTION
+            if given_desc is None:
+                warn(f"--assay '{label}' is not a recognised assay "
+                     f"({', '.join(s for _, _, sp in ASSAY_COUNTS for s in sp[:1])}, …) — "
+                     f"using the generic description '{GENERIC_COUNTS_DESCRIPTION}'. Pass "
+                     f"--assay '{label}=<description>' to set it.")
+        # De-duplicate on the resolved identity, not the spelling: 'scrna', 'scRNAseq' and
+        # 'single-cell RNAseq' are one assay and must yield one row. Labels too degenerate
+        # to produce a suffix fall back to their raw text, so two different unusable labels
+        # stay distinct.
+        identity = suffix or label.strip().lower()
+        if identity in seen:
+            warn(f"--assay '{label}' repeats '{seen[identity]}' — ignored.")
+            continue
+        seen[identity] = label
+        code = f"{COUNTS_CODE_PREFIX}_{suffix}" if suffix else ""
+        if not code or code in taken:
+            while True:
+                counter += 1
+                fallback = f"{COUNTS_CODE_PREFIX}_{counter}"
+                if fallback not in taken:
+                    break
+            warn(f"--assay '{label}': "
+                 + (f"code '{code}' is already used in the dictionaries sheet"
+                    if code else "the label yields no usable code suffix")
+                 + f" — using '{fallback}' instead.")
+            code = fallback
+        taken.add(code)
+        # code == name for every row, matching the template's lower-case `imaging` row.
+        rows.append({"code": code, "name": code, "description": description})
+    return rows
+
+
 def distinct_values(series):
     """Ordered distinct non-empty, non-'NA' values of a column."""
     out, seen = [], set()
@@ -778,6 +878,12 @@ def validate_schema(dictionaries, fields, lookups):
             code = str(r.get("code", "")).strip()
             if not code:
                 continue
+            if code in dict_codes:
+                issues.append(("ERROR", f"dictionaries.code '{code}' appears more than "
+                                        f"once; codes must be unique within the sheet — it "
+                                        f"is the key fields.dictionary_code resolves "
+                                        f"against, so a duplicate silently merges two "
+                                        f"tables (README note 9)."))
             dict_codes.add(code)
             if not RE_CODE.match(code) or code[0].isdigit():
                 issues.append(("ERROR", f"dictionaries.code '{code}' must be letters/"
@@ -858,6 +964,17 @@ def cmd_info(args):
                 for f in tpl.ext_fields],
             "field_types": FIELD_TYPES,
             "vocabularies": tpl.vocab_columns(),
+            # Skill knowledge, not read from the template — a newer template cannot
+            # resync it (see DESIGN.md).
+            "assays": {
+                "recognised": [
+                    {"spellings": list(spellings),
+                     "code": f"{COUNTS_CODE_PREFIX}_{suffix}", "description": desc}
+                    for suffix, desc, spellings in ASSAY_COUNTS],
+                "open_set": f"any other label is accepted, with the generic description "
+                            f"'{GENERIC_COUNTS_DESCRIPTION}' and a WARN; pass "
+                            f"--assay 'label=description' to set it",
+            },
         }
         ovf = tpl.overflow_field()
         if ovf:
@@ -894,6 +1011,14 @@ def cmd_info(args):
         print(f"\nOverflow cell {OVERFLOW_COL}{ovf['row']} ('{ovf['label']}'): a value "
               f"outside this field's\nvocabulary is recorded there as a proposal (WARN) "
               f"instead of being rejected.")
+    print("\n--assay → the counts_data dictionary row for the uploaded counts file")
+    print("(the skill's own mapping, not read from the template):")
+    for suffix, desc, spellings in ASSAY_COUNTS:
+        print(f"  {' | '.join(spellings)}")
+        print(f"      -> {COUNTS_CODE_PREFIX}_{suffix}  |  {desc}")
+    print(f"  any other label is accepted too -> counts_data_<label>  |  "
+          f"'{GENERIC_COUNTS_DESCRIPTION}' (WARN)")
+    print("  pass --assay 'label=description' to set the description yourself")
     print(f"\nfields.type allowed: {', '.join(FIELD_TYPES)}")
     print("\nControlled vocabularies (hidden Catalogue_Data sheet):")
     for name, vals in tpl.vocab_columns().items():
@@ -998,6 +1123,36 @@ def cmd_fill(args):
         fields = read_table(args.fields)
     if args.lookups:
         lookups = read_table(args.lookups)  # replaces any seeded set wholesale
+
+    # --- counts_data row(s) from --assay: appended to the seed, never overriding it. An
+    # explicit --dictionaries replaces the whole sheet, so the rows are dropped there.
+    if args.assay and args.dictionaries:
+        warn("--dictionaries replaces the dictionaries sheet, so the --assay counts_data "
+             "row(s) were not added.")
+    elif args.assay:
+        existing = (dictionaries["code"].tolist()
+                    if dictionaries is not None and "code" in dictionaries else [])
+        rows = counts_data_rows(args.assay, existing, warn)
+        if rows:
+            added = pd.DataFrame(rows)
+            dictionaries = (added if dictionaries is None
+                            else pd.concat([dictionaries, added], ignore_index=True))
+    elif not args.dictionaries:
+        warn("no --assay given, so no counts_data row describes the uploaded counts file. "
+             "The assay is not in metadata.tsv — ask the user which technology "
+             "(scRNAseq / bulk RNAseq / proteomics / spatial transcriptomics / other) the "
+             "submission covers.")
+
+    # --- the three schema sheets stand or fall together. The template's example rows
+    # cross-reference each other (fields.dictionary_code -> test_demographics,
+    # fields.constraints -> SEX), so keeping one sheet's examples while another is replaced
+    # by user data leaves dangling references — a workbook that fails its own validation.
+    # Once any of the three is supplied or seeded, the others are cleared to their headers.
+    if any(t is not None for t in (dictionaries, fields, lookups)):
+        empty = pd.DataFrame()
+        dictionaries = empty if dictionaries is None else dictionaries
+        fields = empty if fields is None else fields
+        lookups = empty if lookups is None else lookups
 
     # --- merge extendedcatalogue: metadata seed (lowest) < config (highest)
     extended = dict(ext_seed)
@@ -1252,6 +1407,11 @@ def main(argv=None):
                                        "+ some descriptive fields (lowest precedence)")
     sp.add_argument("--metadata-dict-code", default="sample_metadata",
                     help="dictionary code for the metadata-seeded table")
+    sp.add_argument("--assay", action="append", metavar="ASSAY[=DESCRIPTION]",
+                    help="technology of the uploaded counts file -> a counts_data "
+                         "dictionary row. Repeatable, or a comma-separated list. Known: "
+                         "scRNAseq, bulk RNAseq, proteomics, spatial transcriptomics; any "
+                         "other label is accepted with a generic description")
     sp.add_argument("--lookup-max-values", type=int, default=20,
                     help="max distinct values for a metadata.tsv text column to become "
                          "a lookup (default 20)")
