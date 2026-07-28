@@ -286,11 +286,11 @@ in place (see *addi* below).
   - `info` — describe the template: its sheets; the mandatory fields (`catalogue`
     title/description/publisher_name; the `*`-marked `extendedcatalogue` fields); the
     `identifier`/`accessRights` rules; the responsible-party fields with the defaults that
-    would be kept; the sample-type overflow cell; the recognised `--assay` labels and the
-    description each produces (noting that other labels are accepted too); and every
+    would be kept; the sample-type overflow cell; the recognised `--assay` labels with the
+    code and description each produces (noting that other labels are accepted too); and every
     dropdown's allowed values (`--json` for machine output). This is how an agent discovers
     valid inputs before filling. Everything shown is read from the template **except the
-    assay→description mapping**, which is the skill's own knowledge rather than the
+    assay→code/description mapping**, which is the skill's own knowledge rather than the
     workbook's — the one deliberate exception to *reads its vocabularies from the template*,
     because the template has no field for it. A newer template therefore resyncs every other
     list automatically, but not this one.
@@ -456,12 +456,14 @@ in place (see *addi* below).
     single value may be a comma-separated list (`--assay scrna,proteomics`) for convenience
     — a description containing a comma must use the repeated form. Labels that normalize
     alike are de-duplicated.
-  - **Every code is `counts_data_<assay>` — there is no bare `counts_data`.** A recognised
-    label uses the canonical suffix from the table; an unrecognised one uses the submitter's
-    own label sanitised to the `code` charset (`lipidomics` → `counts_data_lipidomics`,
-    `ATAC-seq` → `counts_data_atac_seq`). Every row therefore says which technology it
-    describes, whether there is one assay or five, and no code depends on the order the
-    assays were given.
+  - **Every code is `counts_data_` plus a suffix — there is no bare `counts_data`.** The
+    suffix is the assay: a recognised label uses the canonical one from the table, an
+    unrecognised one uses the submitter's own label sanitised to the `code` charset
+    (`lipidomics` → `counts_data_lipidomics`, `ATAC-seq` → `counts_data_atac_seq`). Every
+    row therefore says which technology it describes, whether there is one assay or five,
+    and no code depends on the order the assays were given. The only suffix that is *not*
+    an assay name is the positional fallback below, reached only when a label cannot yield
+    one at all.
   - **The codes cannot collide, with the whole sheet in view.** Two guards make that total
     rather than best-effort: a label that sanitises to nothing (`--assay '???'`) falls back
     to a positional `counts_data_1`, `counts_data_2`, …; and every candidate code is checked
@@ -742,10 +744,10 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
   contains a control character or a `"`, rather than emit it into the shell.
 - **`addi` reads its vocabularies and rules from the shipped template**, so a newer
   portal template (e.g. V1.3+) may add fields or allowed values: point `--template`
-  at the new file and re-run `info` to resync. The **assay→description mapping is the one
-  exception** — the template has no field for it, so it lives in the skill and a new
-  template cannot resync it; it has to be edited in code (or overridden per-run with
-  `--assay label=description`). The skill fills and validates the
+  at the new file and re-run `info` to resync. The **assay→code/description mapping is the
+  one exception** — the template has no field for it, so it lives in the skill and a new
+  template cannot resync either half; both have to be edited in code, though a description
+  can be overridden per-run with `--assay label=description`. The skill fills and validates the
   workbook but **never submits** it to AD Workbench, and it cannot confirm
   hub-specific settings — notably which `workflow_key` Data Access Requests are
   enabled on the target hub (README note 2) — which must be checked against that hub.
