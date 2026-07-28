@@ -286,17 +286,21 @@ in place (see *addi* below).
   - `info` — describe the template: its sheets; the mandatory fields (`catalogue`
     title/description/publisher_name; the `*`-marked `extendedcatalogue` fields); the
     `identifier`/`accessRights` rules; the responsible-party fields with the defaults that
-    would be kept; the sample-type overflow cell; the four recognised `--assay` labels and
-    the description each produces (noting that other labels are accepted too); and every
-    dropdown's allowed values (`--json` for machine output). Everything is read from the template, so `info` is how an agent discovers valid
-    inputs before filling.
+    would be kept; the sample-type overflow cell; the recognised `--assay` labels and the
+    description each produces (noting that other labels are accepted too); and every
+    dropdown's allowed values (`--json` for machine output). This is how an agent discovers
+    valid inputs before filling. Everything shown is read from the template **except the
+    assay→description mapping**, which is the skill's own knowledge rather than the
+    workbook's — the one deliberate exception to *reads its vocabularies from the template*,
+    because the template has no field for it. A newer template therefore resyncs every other
+    list automatically, but not this one.
   - `fill` — the core generator. Loads the template and writes user-supplied values
     into the exact cells, **preserving all dropdowns, prompts, colors, and the hidden
     vocab sheet**, then saves to `--out`. Its inputs are an optional
     `--metadata metadata.tsv` (seeds all three schema tables plus descriptive catalogue /
     extendedcatalogue values), a JSON/YAML `--config` (scalar catalogue /
     extendedcatalogue / settings / workspace_settings values), `--assay` (the `counts_data`
-    dictionary row for the uploaded counts file), and `--dictionaries` / `--fields` /
+    dictionary row(s) for the uploaded counts file), and `--dictionaries` / `--fields` /
     `--lookups` (TSV or CSV, read with pandas — the schema tables given explicitly). How
     they combine is one rule, stated once under *Input precedence* below. Multi-select
     (green) fields spread their values across the Value1..Value6 columns (**max 6**);
@@ -316,8 +320,9 @@ in place (see *addi* below).
     without submitting.
   - All three commands accept `--template PATH` to target a different template file
     (default: the shipped V1.2 workbook).
-- **Input precedence** — stated here once; the bullets below describe *what* each input
-  produces, not how conflicts resolve.
+- **Input precedence** — which input wins when two supply the same thing, stated here once;
+  the bullets below describe *what* each input produces. (Code *collisions* are a separate
+  matter, resolved by suffixing rather than by precedence — see the `--assay` bullet.)
   - **Overriding inputs, in increasing precedence:** `--metadata` (lowest) < `--config` <
     explicit `--dictionaries` / `--fields` / `--lookups`. Where two of them set the same
     thing the later one wins outright: an explicit `--lookups` replaces a seeded lookup set
@@ -333,24 +338,27 @@ in place (see *addi* below).
     template's UK DRI default; and the assay, which comes from the user. A harmonized
     sample table is evidence about samples — never about who is responsible for the dataset
     or what was uploaded.
-- **Rules enforced** (from the README sheet + the embedded data-validations):
-  mandatory fields present (the README's `title`/`description`/`publisher_name` and
-  the `*`-marked `extendedcatalogue` fields); `identifier` is DOI-shaped or blank, while
-  `accessRights` is unconstrained and may be blank; the user-attributed fields below are
-  *warn-and-default*, not blocking; dropdown values ∈ the `Catalogue_Data` vocab (the sole
-  exception being the row-16 sample-type overflow into `J16`, above); `visibility`
-  ∈ {private, internal}; `--assay` labels are **not** restricted to a fixed set — an
-  unrecognised one is a `WARN` with a generic description, never an ERROR — but each must
-  sanitise to a non-empty `code` suffix;
-  catalogue/dictionary `code` = letters/numbers/underscore (dictionary `code` and field
-  `name` additionally must not start with a number); `dictionaries.code` values are
-  **unique within the sheet** — it is the key `fields.dictionary_code` resolves against, so
-  a duplicate would silently merge two tables (this is what the `counts_data_<assay>`
-  suffixing exists to avoid);
-  field `type` ∈ {boolean, date, datetime, decimal, integer, text, time}; boolean
-  fields carry no constraints; `fields.dictionary_code` resolves to a
-  `dictionaries.code`; `fields.constraints` / `lookups.lookup` cross-reference;
-  keywords comma-separated.
+- **Rules enforced** — from the README sheet and the embedded data-validations, plus the
+  addi-specific ones marked *(addi)*. An **ERROR** blocks the write; a `WARN` never does.
+  - *Catalogue*: `title`/`description`/`publisher_name` present (README note 4);
+    `identifier` DOI-shaped or blank *(addi)*; `accessRights` unconstrained, blank allowed
+    *(addi)*; keywords comma-separated.
+  - *Responsible party* **(WARN, not ERROR)**: absent `creator` / `contactPoint` /
+    `dataset owners` keep the template's UK DRI default *(addi)*.
+  - *extendedcatalogue*: `*`-marked fields present; values ∈ the `Catalogue_Data` vocab —
+    the sole exception being the row-16 sample-type overflow into `J16` **(WARN)**;
+    multi-selects ≤ 6 values; single-value fields single-valued; integer fields numeric.
+  - *settings*: `visibility` ∈ {private, internal} (README note 1).
+  - *Assays* **(never ERROR)** *(addi)*: labels are not restricted to a fixed set; an
+    unrecognised one is a `WARN` carrying the generic description, and even a degenerate
+    label yields a valid row via the positional-suffix fallback.
+  - *Schema*: dictionary/catalogue `code` = letters/numbers/underscore, and dictionary
+    `code` / field `name` must not start with a number (README notes 3, 8, 10);
+    `dictionaries.code` **unique within the sheet** — it is the key
+    `fields.dictionary_code` resolves against, so a duplicate would silently merge two
+    tables; `type` ∈ {boolean, date, datetime, decimal, integer, text, time} (11); boolean
+    fields carry no constraints (12); `fields.dictionary_code` resolves to a
+    `dictionaries.code` (9); `fields.constraints` ↔ `lookups.lookup` (13).
 - **User-attributed fields default to UK DRI and must be confirmed.** `creator`
   (catalogue), `contactPoint` (catalogue), and `dataset owners` (workspace_settings)
   identify the people and party responsible for the dataset. Each may be **left blank by
@@ -405,42 +413,57 @@ in place (see *addi* below).
     precedence order above.
 - **The uploaded counts file gets its own `dictionaries` row, selected by `--assay`.** A
   submission uploads a processed counts file alongside the sample annotation, and its
-  *form* depends on the technology. **The assay comes from the user** — it is not a column
-  of `metadata.tsv` and cannot be guessed from the columns that are there, so the agent
-  driving the skill **asks which technology (or technologies) the submission covers**
-  whenever the user has not already said. `--assay` accepts one label or several.
-- **Four assays have a known description; the set is open.** Recognised labels are matched
-  after lower-casing and dropping non-alphanumerics, so `scRNAseq`, `scrnaseq` and
-  `scrna` are the same label:
+  *form* depends on the technology.
+  - **The assay comes from the user.** It is not a column of `metadata.tsv` and cannot be
+    guessed from the columns that are there, so the agent driving the skill **asks which
+    technology (or technologies) the submission covers** whenever the user has not already
+    said. When `--assay` is absent the skill writes **no** `counts_data` row and says so
+    with a `WARN` — a backstop for non-interactive use, not a licence to skip asking. Unlike
+    the responsible-party fields there is no institutional default to fall back on: no value
+    can stand in for a technology only the submitter knows.
+  - **Four labels have a known description; the set is open.** Labels are matched after
+    lower-casing and dropping non-alphanumerics, so `scRNAseq`, `scrnaseq` and `scrna` are
+    one label:
 
-  | assay (any of these spellings) | `description` |
-  |--------------------------------|---------------|
-  | `scRNAseq`, `scrna`, `single-cell RNAseq` | `Processed counts data anndata object file` |
-  | `bulk RNAseq`, `bulk`, `rnaseq` | `Processed counts matrix file` |
-  | `proteomics` | `Processed counts matrix file` |
-  | `spatial transcriptomics`, `spatial`, `visium` | `Processed counts SpatialData .zarr` |
+    | assay (any of these spellings) | `description` |
+    |--------------------------------|---------------|
+    | `scRNAseq`, `scrna`, `single-cell RNAseq` | `Processed counts data anndata object file` |
+    | `bulk RNAseq`, `bulk`, `rnaseq` | `Processed counts matrix file` |
+    | `proteomics` | `Processed counts matrix file` |
+    | `spatial transcriptomics`, `spatial`, `visium` | `Processed counts SpatialData .zarr` |
 
-  - **An unrecognised assay is accepted, not rejected.** The technology list is open by
-    design: submissions arrive with methods the four labels do not cover (metabolomics,
-    lipidomics, ATAC, a bespoke in-house assay). An unknown label produces its own
-    `counts_data` row with the generic description `Processed counts data file` and a `WARN`
-    naming the label and the description used, so the submitter can correct it.
+  - **An unrecognised label is accepted, never rejected.** The technology list is open by
+    design: submissions arrive with methods these four do not cover (metabolomics,
+    lipidomics, ATAC, a bespoke in-house assay). An unknown label gets its own `counts_data`
+    row with the generic description `Processed counts data file` and a `WARN` naming the
+    label and the description used, so the submitter can correct it. **No assay label is
+    ever an ERROR** — see the code-collision rule below for how even a degenerate label
+    still produces a valid row.
   - To give the right description directly, pass `label=description`
     (`--assay 'lipidomics=Processed lipid counts matrix file'`). A supplied description
     always wins, including for the four recognised labels, and suppresses the generic-
     description `WARN`.
-  - `code` and `name` are both the literal `counts_data` — not title-cased, unlike the
-    metadata-seeded row. The row carries **no `fields` rows**: it describes a *file*, not a
+  - `code` and `name` are always **identical to each other** — `counts_data` for a single
+    assay, and whatever suffixed code the rule below assigns otherwise. Neither is
+    title-cased, unlike the metadata-seeded row, matching the template's lower-case
+    `imaging` row. The row carries **no `fields` rows**: it describes a *file*, not a
     table of variables. This mirrors the template's own shipped `imaging` / `imaging` /
     "Imaging data files for participants" row, which likewise has no `fields` entries, and
     needs no validation change (`fields.dictionary_code` must resolve to a
     `dictionaries.code`, never the reverse).
   - **Several assays.** `--assay` is repeatable (`--assay scrna --assay proteomics`), and a
     single value may be a comma-separated list (`--assay scrna,proteomics`) for convenience
-    — a description containing a comma must use the repeated form. The first assay takes the
-    bare `counts_data` code and each subsequent one is suffixed with its label, sanitised to
-    the `code` charset (`counts_data_proteomics`, `counts_data_lipidomics`), because
-    `dictionaries.code` must be unique within the sheet. Repeated labels are de-duplicated.
+    — a description containing a comma must use the repeated form. Labels that normalize
+    alike are de-duplicated.
+  - **Codes are assigned so they cannot collide, with the whole sheet in view.** The first
+    assay takes the bare `counts_data`; each later one is suffixed with its label sanitised
+    to the `code` charset (`counts_data_proteomics`, `counts_data_lipidomics`). Two guards
+    make that total rather than best-effort: a label that sanitises to nothing (`--assay
+    '???'`) falls back to a positional `counts_data_2`, `counts_data_3`, …; and every
+    candidate code is checked against the codes **already in the dictionaries table** —
+    including a `--metadata-dict-code` that happens to be `counts_data` — and given the same
+    positional suffix if taken. So the uniqueness rule holds across the sheet, not merely
+    among the assay rows, and no combination of inputs can produce a duplicate `code`.
   - Two consequences of that scheme, both deliberate: which assay wins the bare
     `counts_data` code is **positional**, not self-describing — accepted so that the common
     single-assay case yields exactly the `counts_data` code the submission expects; and
@@ -451,10 +474,6 @@ in place (see *addi* below).
     and lookups) plus `counts_data` (the uploaded file). `--assay` also works alone: with no
     `--metadata` the `dictionaries` sheet holds only the `counts_data` row(s). See *Input
     precedence* above for how it combines with the other inputs.
-  - When `--assay` is absent the skill writes **no** `counts_data` row and says so with a
-    `WARN` — a backstop for non-interactive use, not a licence to skip asking. Unlike the
-    responsible-party fields there is no institutional default to fall back on: no value
-    can stand in for a technology only the submitter knows.
 - **Generate, don't submit** — `fill` writes the workbook only; the skill never
   uploads to AD Workbench (mirrors `sra` and the download-script generators).
 
@@ -720,7 +739,10 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
   contains a control character or a `"`, rather than emit it into the shell.
 - **`addi` reads its vocabularies and rules from the shipped template**, so a newer
   portal template (e.g. V1.3+) may add fields or allowed values: point `--template`
-  at the new file and re-run `info` to resync. The skill fills and validates the
+  at the new file and re-run `info` to resync. The **assay→description mapping is the one
+  exception** — the template has no field for it, so it lives in the skill and a new
+  template cannot resync it; it has to be edited in code (or overridden per-run with
+  `--assay label=description`). The skill fills and validates the
   workbook but **never submits** it to AD Workbench, and it cannot confirm
   hub-specific settings — notably which `workflow_key` Data Access Requests are
   enabled on the target hub (README note 2) — which must be checked against that hub.
