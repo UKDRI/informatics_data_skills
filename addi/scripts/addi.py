@@ -69,8 +69,11 @@ SHEET_VOCAB = "Catalogue_Data"
 # Mandatory catalogue keys per the template README, note (4).
 CATALOGUE_MANDATORY = ["title", "description", "publisher_name"]
 
-# Always required from user-provided input — a deliberate addi-specific addition
-# beyond the README's mandatory set (see DESIGN.md). NEVER guessed or defaulted.
+# The people/party responsible for the dataset. These are *warn-and-default*, not
+# blocking: when the user supplies none, the template's UK DRI value is kept and a WARN
+# asks them to confirm or override it (see DESIGN.md, decision 11). The one hard rule is
+# NEVER GUESS A PERSON — the only permitted fallback is the template's own institutional
+# value, never the environment, the git identity or the user's own email address.
 USER_ATTRIBUTED = [
     ("catalogue", "creator"),
     ("catalogue", "contactPoint"),
@@ -87,12 +90,36 @@ FIELD_TYPES = ["boolean", "date", "datetime", "decimal", "integer", "text", "tim
 RE_CODE = re.compile(r"^[A-Za-z0-9_]+$")            # letters, numbers, underscore
 RE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")   # + cannot start with a number
 
+# catalogue.identifier must be a DOI or blank (see DESIGN.md). Bare-DOI syntax per
+# ANSI/NISO Z39.84: the "10." prefix, a registrant code, "/", then the suffix.
+RE_DOI = re.compile(r"^10\.\d{4,9}/\S+$")
+DOI_RESOLVER = "https://doi.org/"
+
 VALUE_COLS = ["D", "E", "F", "G", "H", "I"]         # extendedcatalogue Value1..Value6
+
+# The first cell past Value6 ("J"): the sample-type overflow cell, which carries no
+# data-validation and no fill, so a proposed out-of-vocabulary term can be recorded there
+# without corrupting a dropdown (see DESIGN.md).
+OVERFLOW_COL = chr(ord(VALUE_COLS[-1]) + 1)
+
+# The one extendedcatalogue dropdown with an overflow cell. Matched on the normalized
+# label so the row number is read from the template rather than hardcoded (row 16 in the
+# shipped V1.2 workbook).
+EXT_OVERFLOW_FIELD = "type of sample from which data were derived"
 
 # extendedcatalogue single-value fields carrying a genuine UK DRI default (not a
 # throwaway example): keep the template's value when the user provides none. Matched on
 # the normalized label; the Logo field is matched by its URL kind (see the fill block).
 EXT_KEEP_DEFAULT_LABELS = {"organization"}
+
+# catalogue keys whose shipped value is a genuine UK DRI default rather than an example
+# placeholder: kept verbatim when the user supplies nothing, regardless of casing (so the
+# is_caps_placeholder heuristic can never clear one). See DESIGN.md.
+CAT_KEEP_DEFAULT_KEYS = {"license", "publisher_name", "publisher_url", "language",
+                         "contactPoint", "creator", "accessRights"}
+
+# metadata.tsv columns never turned into a lookup: they identify a row, not a category.
+LOOKUP_SKIP_COLUMNS = {"sample", "sample_id", "id", "replicate"}
 
 
 # ===========================================================================
@@ -118,6 +145,52 @@ def clean_text(value):
 def xml_escape(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
              .replace('"', "&quot;"))
+
+
+# ===========================================================================
+# catalogue.identifier — a DOI, or blank (see DESIGN.md)
+# ===========================================================================
+def normalize_doi(value):
+    """Return (canonical_doi_url, error). Exactly one of the two is None.
+
+    Accepts the bare DOI (10.5281/zenodo.123456), the 'doi:'-prefixed form and the
+    resolver URL (http(s)://(dx.)doi.org/10.…), and returns the canonical
+    'https://doi.org/10.…' form. Anything else — a repository accession, a non-DOI URL,
+    free text — is an error: the field is for a citable dataset DOI, not a source
+    accession.
+    """
+    s = str(value).strip()
+    bare = re.sub(r"(?i)^https?://(?:dx\.)?doi\.org/", "", s)
+    bare = re.sub(r"(?i)^doi:\s*", "", bare).strip()
+    if not RE_DOI.match(bare):
+        return None, (f"'{s}' is not a DOI. Give a DOI (10.xxxx/suffix, doi:10.xxxx/… "
+                      f"or https://doi.org/10.xxxx/…) or leave identifier blank — this "
+                      f"field is for a citable dataset DOI, not a source accession.")
+    return DOI_RESOLVER + bare, None
+
+
+# ===========================================================================
+# Dropdown vocabulary matching
+# ===========================================================================
+def split_by_vocab(values, allowed):
+    """Split values into (matched, unmatched).
+
+    Matching is case-insensitive; a matched value is returned in the vocabulary's own
+    casing so the written cell satisfies the template's dropdown. Order is preserved and
+    duplicates (case-insensitively) are dropped.
+    """
+    canonical = {str(a).strip().lower(): str(a).strip() for a in allowed}
+    matched, unmatched, seen = [], [], set()
+    for v in values:
+        s = str(v).strip()
+        if not s or s.lower() in seen:
+            continue
+        seen.add(s.lower())
+        if s.lower() in canonical:
+            matched.append(canonical[s.lower()])
+        else:
+            unmatched.append(s)
+    return matched, unmatched
 
 
 # ===========================================================================
@@ -306,6 +379,28 @@ class Template:
         return [str(ws.cell(row=r, column=2).value).strip()
                 for r in range(2, ws.max_row + 1)
                 if ws.cell(row=r, column=2).value]
+
+    def shipped_value(self, sheet, key):
+        """The value the template ships for a key/value sheet row, or '' if absent.
+
+        Used to report the default that will be kept — read from the template so the
+        message never drifts from the shipped file.
+        """
+        ws = self.wb[sheet]
+        key_col, val_col = (2, 3) if sheet == SHEET_WORKSPACE else (1, 2)
+        for r in range(2, ws.max_row + 1):
+            k = ws.cell(row=r, column=key_col).value
+            if k is not None and str(k).strip() == key:
+                v = ws.cell(row=r, column=val_col).value
+                return "" if v is None else str(v).strip()
+        return ""
+
+    def overflow_field(self):
+        """The one extendedcatalogue field with an overflow cell, or None."""
+        for f in self.ext_fields:
+            if f["norm"] == EXT_OVERFLOW_FIELD:
+                return f
+        return None
 
 
 def normalize_key(label):
@@ -496,8 +591,25 @@ def sanitize_name(col):
     return name
 
 
-def seed_from_metadata(path, dict_code, warn):
-    """Return (dictionaries_df, fields_df, extended_seed) derived from a metadata.tsv."""
+def distinct_values(series):
+    """Ordered distinct non-empty, non-'NA' values of a column."""
+    out, seen = [], set()
+    for v in series.tolist():
+        s = str(v).strip()
+        if s == "" or s == "NA" or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def seed_from_metadata(path, dict_code, lookup_max_values, warn):
+    """Return (dictionaries_df, fields_df, lookups_df, extended_seed) from a metadata.tsv.
+
+    All three schema tables are seeded: one dictionary for the table, one `fields` row per
+    column, and `lookups` derived from each categorical column's unique values (see
+    DESIGN.md for the qualifying criteria).
+    """
     df = read_table(path)
     if not RE_CODE.match(dict_code) or dict_code[0].isdigit():
         sys.exit(f"--metadata-dict-code '{dict_code}' must be letters/numbers/"
@@ -505,28 +617,69 @@ def seed_from_metadata(path, dict_code, warn):
     dictionaries = pd.DataFrame(
         [{"code": dict_code, "name": dict_code.replace("_", " ").title(),
           "description": f"Seeded from {os.path.basename(path)}"}])
-    frows = []
+
+    nrows = int(len(df))
+    frows, lrows, seen_lookups = [], [], {}
     for col in df.columns:
         name = sanitize_name(col)
         if name != col:
             warn(f"metadata column '{col}' -> field name '{name}'")
+        ftype = infer_field_type(df[col])
+
+        # lookups: a text column whose distinct values form a small enumeration becomes a
+        # lookup, and this field's `constraints` points at it.
+        constraints = ""
+        if ftype == "text" and col.strip().lower() not in LOOKUP_SKIP_COLUMNS \
+                and name.lower() not in LOOKUP_SKIP_COLUMNS:
+            vals = distinct_values(df[col])
+            if 2 <= len(vals) <= lookup_max_values and len(vals) < nrows:
+                lookup = name.upper()
+                if lookup in seen_lookups:
+                    warn(f"metadata column '{col}' would reuse lookup name '{lookup}' "
+                         f"(already seeded from '{seen_lookups[lookup]}') — left without "
+                         f"constraints; supply --lookups to disambiguate.")
+                else:
+                    seen_lookups[lookup] = col
+                    constraints = lookup
+                    for v in sorted(vals):
+                        lrows.append({"lookup": lookup, "name": v,
+                                      "description": v, "uri": ""})
+                    warn(f"seeded lookup '{lookup}' ({len(vals)} value(s)) and "
+                         f"fields.constraints for column '{col}' — these are only the "
+                         f"values present in {os.path.basename(path)}; review for "
+                         f"completeness.")
+
         frows.append({
             "dictionary_code": dict_code, "name": name, "label": str(col),
-            "type": infer_field_type(df[col]), "constraints": "",
+            "type": ftype, "constraints": constraints,
             "description": "", "uri": "",
             "entity": "true" if name.lower() in ("id", "sample", "sample_id") else "false",
             "cohort_filter": "false",
         })
     fields = pd.DataFrame(frows)
+    lookups = pd.DataFrame(lrows) if lrows else None
 
     # Conservative descriptive seeding (guesses — warned, overridden by --config).
     extended_seed = {}
     id_col = next((c for c in df.columns if c.lower() in ("sample", "sample_id", "id")),
                   None)
-    n = int(df[id_col].nunique()) if id_col else int(len(df))
+    n = int(df[id_col].nunique()) if id_col else nrows
     extended_seed["Number of Biosamples"] = n
     warn(f"seeded 'Number of Biosamples' = {n} (from metadata.tsv; review).")
-    return dictionaries, fields, extended_seed
+
+    # Sample types come from `tissue`, falling back to sample_type / source_name. The
+    # values are seeded raw; matching them against the template vocabulary (and routing
+    # anything unmatched to the overflow cell) happens in one place, at validate/fill.
+    tissue_col = next((c for c in df.columns
+                       if c.strip().lower() in ("tissue", "sample_type", "source_name")),
+                      None)
+    if tissue_col:
+        vals = distinct_values(df[tissue_col])
+        if vals:
+            extended_seed["Type of Sample From Which Data Were Derived"] = vals
+            warn(f"seeded sample types from metadata column '{tissue_col}': "
+                 f"{', '.join(vals)} (review).")
+    return dictionaries, fields, lookups, extended_seed
 
 
 # ===========================================================================
@@ -548,13 +701,25 @@ def validate_inputs(tpl, cfg, dictionaries, fields, lookups):
         if is_empty(cat.get(key)):
             issues.append(("ERROR", f"catalogue.{key} is mandatory (README note 4)."))
 
-    # always-required user-attributed fields (addi exception — see DESIGN.md)
+    # catalogue.identifier must be a DOI or blank (see DESIGN.md)
+    ident = cat.get("identifier")
+    if not is_empty(ident):
+        canonical, err = normalize_doi(ident)
+        if err:
+            issues.append(("ERROR", f"catalogue.identifier {err}"))
+        elif canonical != str(ident).strip():
+            issues.append(("WARN", f"catalogue.identifier '{str(ident).strip()}' will be "
+                                   f"normalized to '{canonical}'."))
+
+    # user-attributed fields: warn-and-default, never blocking (see DESIGN.md)
     for sheet, key in USER_ATTRIBUTED:
         src = cat if sheet == "catalogue" else ws
         if is_empty(src.get(key)):
-            issues.append(("ERROR",
-                           f"{sheet}.'{key}' must be provided by the user "
-                           f"(never inferred; see DESIGN.md)."))
+            default = tpl.shipped_value(sheet, key)
+            issues.append(("WARN",
+                           f"{sheet}.'{key}' not supplied — keeping the template's "
+                           f"default '{default}'. Confirm it or override it; it is never "
+                           f"inferred from the environment or your identity."))
 
     # settings.visibility (README note 1)
     vis = settings.get("visibility")
@@ -569,11 +734,25 @@ def validate_inputs(tpl, cfg, dictionaries, fields, lookups):
         if f["mandatory"] and not vals:
             issues.append(("ERROR", f"extendedcatalogue '{f['label']}' is mandatory."))
         if f["allowed"] is not None and vals:
-            allowed_ci = {a.lower(): a for a in f["allowed"]}
-            for v in vals:
-                if str(v).strip().lower() not in allowed_ci:
-                    issues.append(("ERROR", f"extendedcatalogue '{f['label']}' value "
-                                            f"'{v}' is not in the allowed dropdown list."))
+            # The sample-type field is the one dropdown with an overflow cell: a value the
+            # vocabulary cannot express is reported and recorded in the overflow cell as a
+            # proposal, not rejected. Every other dropdown still hard-ERRORs.
+            if f["norm"] == EXT_OVERFLOW_FIELD:
+                vals, overflow = split_by_vocab(vals, f["allowed"])
+                for v in overflow:
+                    issues.append((
+                        "WARN", f"extendedcatalogue '{f['label']}' value '{v}' is not in "
+                                f"the template vocabulary ({', '.join(f['allowed'])}) — "
+                                f"it goes into the {OVERFLOW_COL}{f['row']} overflow cell "
+                                f"as a proposed new term. Confirm it with ADDI before "
+                                f"submitting."))
+            else:
+                allowed_ci = {a.lower(): a for a in f["allowed"]}
+                for v in vals:
+                    if str(v).strip().lower() not in allowed_ci:
+                        issues.append(("ERROR", f"extendedcatalogue '{f['label']}' value "
+                                                f"'{v}' is not in the allowed dropdown "
+                                                f"list."))
         if f["multi"] and len(vals) > len(VALUE_COLS):
             issues.append(("ERROR", f"extendedcatalogue '{f['label']}' has {len(vals)} "
                                     f"values but only {len(VALUE_COLS)} are allowed."))
@@ -666,7 +845,10 @@ def cmd_info(args):
             "sheets": tpl.wb.sheetnames,
             "catalogue_keys": tpl.catalogue_keys(),
             "catalogue_mandatory": CATALOGUE_MANDATORY,
-            "user_attributed_required": [f"{s}.{k}" for s, k in USER_ATTRIBUTED],
+            "catalogue_identifier": "a DOI, or blank (normalized to "
+                                    "https://doi.org/10.…)",
+            "user_attributed_defaults": {
+                f"{s}.{k}": tpl.shipped_value(s, k) for s, k in USER_ATTRIBUTED},
             "settings_keys": tpl.settings_keys(),
             "settings_visibility_allowed": VISIBILITY_ALLOWED,
             "workspace_keys": tpl.workspace_keys(),
@@ -677,6 +859,13 @@ def cmd_info(args):
             "field_types": FIELD_TYPES,
             "vocabularies": tpl.vocab_columns(),
         }
+        ovf = tpl.overflow_field()
+        if ovf:
+            out["overflow_cell"] = {
+                "field": ovf["label"], "cell": f"{OVERFLOW_COL}{ovf['row']}",
+                "note": "values outside this field's vocabulary are recorded here as a "
+                        "proposal (WARN) instead of being rejected",
+            }
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return
 
@@ -686,9 +875,13 @@ def cmd_info(args):
     for k in tpl.catalogue_keys():
         star = " *" if k in CATALOGUE_MANDATORY else ""
         print(f"  {k}{star}")
-    print("\nAlways required from the user (addi rule — never inferred):")
+    print("\nidentifier: a DOI, or blank (normalized to https://doi.org/10.…)")
+    print("accessRights: optional, free text (template default: "
+          f"'{tpl.shipped_value(SHEET_CATALOGUE, 'accessRights')}')")
+    print("\nResponsible-party fields — kept at the template default unless you "
+          "override them.\nAsk the user whether to change these; never infer them:")
     for s, k in USER_ATTRIBUTED:
-        print(f"  {s}.{k}")
+        print(f"  {s}.{k} = '{tpl.shipped_value(s, k)}'")
     print(f"\nsettings.visibility allowed: {', '.join(VISIBILITY_ALLOWED)}")
     print("\nextendedcatalogue fields (mandatory marked *):")
     for f in tpl.ext_fields:
@@ -696,6 +889,11 @@ def cmd_info(args):
         tag = f["kind"] + ("[multi]" if f["multi"] else "")
         n = f" — {len(f['allowed'])} allowed values" if f["allowed"] else ""
         print(f"  {star} {f['label']}  ({tag}){n}")
+    ovf = tpl.overflow_field()
+    if ovf:
+        print(f"\nOverflow cell {OVERFLOW_COL}{ovf['row']} ('{ovf['label']}'): a value "
+              f"outside this field's\nvocabulary is recorded there as a proposal (WARN) "
+              f"instead of being rejected.")
     print(f"\nfields.type allowed: {', '.join(FIELD_TYPES)}")
     print("\nControlled vocabularies (hidden Catalogue_Data sheet):")
     for name, vals in tpl.vocab_columns().items():
@@ -729,10 +927,19 @@ def read_filled_workbook(tpl, path):
     }
     ext_ws = wb[SHEET_EXTENDED]
     for f in tpl.ext_fields:
+        # The sample-type row is read one column wider so a proposed term parked in the
+        # overflow cell round-trips and is reported by validation.
+        last = OVERFLOW_COL if f["norm"] == EXT_OVERFLOW_FIELD else VALUE_COLS[-1]
+        overflow_col = col_to_num(OVERFLOW_COL)
         vals = []
-        for col in range(col_to_num(VALUE_COLS[0]), col_to_num(VALUE_COLS[-1]) + 1):
+        for col in range(col_to_num(VALUE_COLS[0]), col_to_num(last) + 1):
             v = ext_ws.cell(row=f["row"], column=col).value
-            if v is not None and str(v).strip() != "":
+            if v is None or str(v).strip() == "":
+                continue
+            if col == overflow_col:
+                # the overflow cell holds comma-separated proposed terms
+                vals.extend(s.strip() for s in str(v).split(",") if s.strip())
+            else:
                 vals.append(v)
         if vals:
             cfg["extendedcatalogue"][f["label"]] = vals
@@ -783,14 +990,14 @@ def cmd_fill(args):
     dictionaries = fields = lookups = None
     ext_seed = {}
     if args.metadata:
-        dictionaries, fields, ext_seed = seed_from_metadata(
-            args.metadata, args.metadata_dict_code, warn)
+        dictionaries, fields, lookups, ext_seed = seed_from_metadata(
+            args.metadata, args.metadata_dict_code, args.lookup_max_values, warn)
     if args.dictionaries:
         dictionaries = read_table(args.dictionaries)
     if args.fields:
         fields = read_table(args.fields)
     if args.lookups:
-        lookups = read_table(args.lookups)
+        lookups = read_table(args.lookups)  # replaces any seeded set wholesale
 
     # --- merge extendedcatalogue: metadata seed (lowest) < config (highest)
     extended = dict(ext_seed)
@@ -799,12 +1006,21 @@ def cmd_fill(args):
     cfg = dict(cfg)
     cfg["extendedcatalogue"] = extended
 
-    # --- validate before writing (fail fast; user-attributed enforcement lives here)
+    # --- validate before writing (fail fast on ERRORs; the user-attributed fields
+    # warn-and-default rather than block — see DESIGN.md). Validation sees the identifier
+    # as the user gave it, so it is the one place that reports the DOI rewrite.
     issues = validate_inputs(tpl, cfg, dictionaries, fields, lookups)
     _report(issues)
     if any(sev == "ERROR" for sev, _ in issues):
-        sys.exit("Refusing to write: fix the ERROR(s) above. "
-                 "creator / contactPoint / dataset owners must come from you.")
+        sys.exit("Refusing to write: fix the ERROR(s) above.")
+
+    # --- normalize catalogue.identifier to a canonical DOI URL (validated above)
+    cat = dict(cfg.get("catalogue", {}) or {})
+    if str(cat.get("identifier", "")).strip():
+        canonical, _ = normalize_doi(cat["identifier"])
+        if canonical:
+            cat["identifier"] = canonical
+            cfg["catalogue"] = cat
 
     # --- surgical write
     edited = build_filled_workbook(tpl, cfg, dictionaries, fields, lookups)
@@ -841,6 +1057,8 @@ def build_filled_workbook(tpl, cfg, dictionaries, fields, lookups):
             kind = "empty" if str(val).strip() == "" else "str"
             sx.set_cell(f"B{r}", val, kind=kind, default_style="4")
             cat_modified.append(f"B{r}")
+        elif key in CAT_KEEP_DEFAULT_KEYS:
+            continue  # a genuine UK DRI default — keep the shipped value verbatim
         elif is_caps_placeholder(ws.cell(row=r, column=2).value):
             sx.set_cell(f"B{r}", "", kind="empty")
             cat_modified.append(f"B{r}")
@@ -893,6 +1111,16 @@ def build_filled_workbook(tpl, cfg, dictionaries, fields, lookups):
         # user provides none — leave the cell (and any hyperlink) untouched.
         if not vals and (f["norm"] in EXT_KEEP_DEFAULT_LABELS or f["kind"] == "url"):
             continue
+        # Dropdown values are written in the vocabulary's own casing, so a cell always
+        # satisfies its data-validation. For the sample-type field only, values the
+        # vocabulary cannot express are split off into the overflow cell.
+        overflow = []
+        if f["allowed"] is not None and vals:
+            matched, unmatched = split_by_vocab(vals, f["allowed"])
+            if f["norm"] == EXT_OVERFLOW_FIELD:
+                vals, overflow = matched, unmatched
+            elif matched:
+                vals = matched  # unmatched values are already an ERROR in validation
         ncols = len(VALUE_COLS) if f["multi"] else 1
         for i in range(ncols):
             ref = f"{VALUE_COLS[i]}{f['row']}"
@@ -901,6 +1129,10 @@ def build_filled_workbook(tpl, cfg, dictionaries, fields, lookups):
                 sx.set_cell(ref, vals[i], kind=kind)
             else:
                 sx.set_cell(ref, "", kind="empty")  # clear leftover example
+            ext_modified.append(ref)
+        if f["norm"] == EXT_OVERFLOW_FIELD:
+            ref = f"{OVERFLOW_COL}{f['row']}"
+            sx.set_cell(ref, ", ".join(overflow), kind="str" if overflow else "empty")
             ext_modified.append(ref)
     sx.drop_hyperlinks(ext_modified)  # e.g. the example Logo link on an overwritten/cleared cell
     edited[fn] = sx.serialize()
@@ -926,7 +1158,8 @@ def build_filled_workbook(tpl, cfg, dictionaries, fields, lookups):
 def is_caps_placeholder(value):
     """True for the template's ALL-CAPS placeholder cells (e.g. 'TITLE',
     'LIST KEYWORDS', 'IDENTETIFIER') — cleared when the user provides no value. Genuine
-    defaults are mixed- or lower-case ('en', a URL, 'GEO/ArrayExpress') and are kept."""
+    defaults are mixed- or lower-case ('en', a URL, 'non-commercial use') and are kept;
+    the keys in CAT_KEEP_DEFAULT_KEYS are kept regardless of casing."""
     if value is None:
         return False
     s = str(value).strip()
@@ -1015,10 +1248,13 @@ def main(argv=None):
     add_template(sp)
     sp.add_argument("--config", help="JSON/YAML with catalogue/extendedcatalogue/"
                                      "settings/workspace_settings values")
-    sp.add_argument("--metadata", help="metadata.tsv to seed the schema + some "
-                                       "descriptive fields (lowest precedence)")
+    sp.add_argument("--metadata", help="metadata.tsv to seed dictionaries/fields/lookups "
+                                       "+ some descriptive fields (lowest precedence)")
     sp.add_argument("--metadata-dict-code", default="sample_metadata",
                     help="dictionary code for the metadata-seeded table")
+    sp.add_argument("--lookup-max-values", type=int, default=20,
+                    help="max distinct values for a metadata.tsv text column to become "
+                         "a lookup (default 20)")
     sp.add_argument("--dictionaries", help="dictionaries table (TSV/CSV)")
     sp.add_argument("--fields", help="fields table (TSV/CSV)")
     sp.add_argument("--lookups", help="lookups table (TSV/CSV)")
