@@ -286,9 +286,9 @@ in place (see *addi* below).
   - `info` — describe the template: its sheets; the mandatory fields (`catalogue`
     title/description/publisher_name; the `*`-marked `extendedcatalogue` fields); the
     `identifier`/`accessRights` rules; the responsible-party fields with the defaults that
-    would be kept; the sample-type overflow cell; the allowed `--assay` values and the
-    description each produces; and every dropdown's allowed values (`--json` for machine
-    output). Everything is read from the template, so `info` is how an agent discovers valid
+    would be kept; the sample-type overflow cell; the four recognised `--assay` labels and
+    the description each produces (noting that other labels are accepted too); and every
+    dropdown's allowed values (`--json` for machine output). Everything is read from the template, so `info` is how an agent discovers valid
     inputs before filling.
   - `fill` — the core generator. Loads the template and writes user-supplied values
     into the exact cells, **preserving all dropdowns, prompts, colors, and the hidden
@@ -339,7 +339,9 @@ in place (see *addi* below).
   `accessRights` is unconstrained and may be blank; the user-attributed fields below are
   *warn-and-default*, not blocking; dropdown values ∈ the `Catalogue_Data` vocab (the sole
   exception being the row-16 sample-type overflow into `J16`, above); `visibility`
-  ∈ {private, internal}; `--assay` ∈ {scrna, bulk, proteomics, spatial};
+  ∈ {private, internal}; `--assay` labels are **not** restricted to a fixed set — an
+  unrecognised one is a `WARN` with a generic description, never an ERROR — but each must
+  sanitise to a non-empty `code` suffix;
   catalogue/dictionary `code` = letters/numbers/underscore (dictionary `code` and field
   `name` additionally must not start with a number); `dictionaries.code` values are
   **unique within the sheet** — it is the key `fields.dictionary_code` resolves against, so
@@ -403,26 +405,42 @@ in place (see *addi* below).
     precedence order above.
 - **The uploaded counts file gets its own `dictionaries` row, selected by `--assay`.** A
   submission uploads a processed counts file alongside the sample annotation, and its
-  *form* depends on the technology:
+  *form* depends on the technology. **The assay comes from the user** — it is not a column
+  of `metadata.tsv` and cannot be guessed from the columns that are there, so the agent
+  driving the skill **asks which technology (or technologies) the submission covers**
+  whenever the user has not already said. `--assay` accepts one label or several.
+- **Four assays have a known description; the set is open.** Recognised labels are matched
+  after lower-casing and dropping non-alphanumerics, so `scRNAseq`, `scrnaseq` and
+  `scrna` are the same label:
 
-  | `--assay` | `code` / `name` | `description` |
-  |-----------|-----------------|---------------|
-  | `scrna` | `counts_data` | `Processed counts data anndata object file` |
-  | `bulk` | `counts_data` | `Processed counts matrix file` |
-  | `proteomics` | `counts_data` | `Processed counts matrix file` |
-  | `spatial` | `counts_data` | `Processed counts SpatialData .zarr` |
+  | assay (any of these spellings) | `description` |
+  |--------------------------------|---------------|
+  | `scRNAseq`, `scrna`, `single-cell RNAseq` | `Processed counts data anndata object file` |
+  | `bulk RNAseq`, `bulk`, `rnaseq` | `Processed counts matrix file` |
+  | `proteomics` | `Processed counts matrix file` |
+  | `spatial transcriptomics`, `spatial`, `visium` | `Processed counts SpatialData .zarr` |
 
+  - **An unrecognised assay is accepted, not rejected.** The technology list is open by
+    design: submissions arrive with methods the four labels do not cover (metabolomics,
+    lipidomics, ATAC, a bespoke in-house assay). An unknown label produces its own
+    `counts_data` row with the generic description `Processed counts data file` and a `WARN`
+    naming the label and the description used, so the submitter can correct it.
+  - To give the right description directly, pass `label=description`
+    (`--assay 'lipidomics=Processed lipid counts matrix file'`). A supplied description
+    always wins, including for the four recognised labels, and suppresses the generic-
+    description `WARN`.
   - `code` and `name` are both the literal `counts_data` — not title-cased, unlike the
     metadata-seeded row. The row carries **no `fields` rows**: it describes a *file*, not a
     table of variables. This mirrors the template's own shipped `imaging` / `imaging` /
     "Imaging data files for participants" row, which likewise has no `fields` entries, and
     needs no validation change (`fields.dictionary_code` must resolve to a
     `dictionaries.code`, never the reverse).
-  - `--assay` takes one of the four values or a comma-separated list of them
-    (`--assay scrna,proteomics`). The first assay takes the bare `counts_data` code and
-    each subsequent one is suffixed with its assay name (`counts_data_proteomics`), because
-    `dictionaries.code` must be unique within the sheet. Repeated values are de-duplicated;
-    an unrecognised value is an **ERROR** listing the four allowed ones.
+  - **Several assays.** `--assay` is repeatable (`--assay scrna --assay proteomics`), and a
+    single value may be a comma-separated list (`--assay scrna,proteomics`) for convenience
+    — a description containing a comma must use the repeated form. The first assay takes the
+    bare `counts_data` code and each subsequent one is suffixed with its label, sanitised to
+    the `code` charset (`counts_data_proteomics`, `counts_data_lipidomics`), because
+    `dictionaries.code` must be unique within the sheet. Repeated labels are de-duplicated.
   - Two consequences of that scheme, both deliberate: which assay wins the bare
     `counts_data` code is **positional**, not self-describing — accepted so that the common
     single-assay case yields exactly the `counts_data` code the submission expects; and
@@ -433,18 +451,10 @@ in place (see *addi* below).
     and lookups) plus `counts_data` (the uploaded file). `--assay` also works alone: with no
     `--metadata` the `dictionaries` sheet holds only the `counts_data` row(s). See *Input
     precedence* above for how it combines with the other inputs.
-  - **The assay must come from the user; it is never derived from the data.** It is not a
-    column of `metadata.tsv` and cannot be guessed from the columns that are there, so the
-    agent driving the skill **asks the user which technology the submission covers — or uses
-    the answer they already gave earlier in the conversation** — before filling. When
-    `--assay` is absent the skill writes **no** `counts_data` row and says so with a `WARN`;
-    there is no institutional default to fall back on, unlike the responsible-party fields.
-  - Note the deliberate difference from those fields: for them, something merely *present*
-    in the environment or prior context is **not** consent, because getting a person wrong
-    misattributes work. The assay is a factual property of the submission that only the
-    submitter knows, so the user having stated it earlier in the conversation *is* them
-    supplying it. What is forbidden in both cases is the same: inventing the value from
-    the data or the environment.
+  - When `--assay` is absent the skill writes **no** `counts_data` row and says so with a
+    `WARN` — a backstop for non-interactive use, not a licence to skip asking. Unlike the
+    responsible-party fields there is no institutional default to fall back on: no value
+    can stand in for a technology only the submitter knows.
 - **Generate, don't submit** — `fill` writes the workbook only; the skill never
   uploads to AD Workbench (mirrors `sra` and the download-script generators).
 
@@ -527,9 +537,11 @@ bulk, because it cannot be reliably inferred from the metadata:
 
 One row per run; rows sharing a `sample` value are concatenated by the pipeline.
 
-`addi` reuses the flag *name* with a **wider value set** (adding `proteomics` and
-`spatial`) and a different job: there it selects the `counts_data` file-type
-**description**, not a sample-sheet format. The two are deliberately not interchangeable.
+`addi` reuses the flag *name* for a different job — selecting the `counts_data` file-type
+**description** rather than a sample-sheet format — and, unlike here, its value set is
+**open**: any label is accepted, with four having a known description. The two flags are
+deliberately not interchangeable; only this one is a closed two-value choice, because
+each value maps to a specific pipeline's column layout.
 
 - **Pairing**: R1/R2 detected from filename (`_1`/`_2`, `R1`/`R2`); index reads
   (`_I1`, `_R3`, `_3`) are dropped; falls back to positional order.
