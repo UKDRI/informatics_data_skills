@@ -52,6 +52,11 @@ do
         then
                 pigz -p $ncpu $outdir/${id}_3.fastq
         fi
+        if [ -e $outdir/${id}_4.fastq ]
+        then
+                pigz -p $ncpu $outdir/${id}_4.fastq
+        fi
+
         echo "Done."
 done
 echo "ALL DONE."

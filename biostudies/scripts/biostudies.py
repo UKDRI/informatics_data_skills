@@ -226,7 +226,8 @@ def write_metadata_tsv(rows, out):
             if k not in header:
                 header.append(k)
     with open(out, "w", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
+        # LF, not csv.writer's default CRLF (see DESIGN.md "Clean output fields")
+        w = csv.writer(fh, delimiter="\t", lineterminator="\n")
         w.writerow(header)
         for r in rows:
             w.writerow([r.get(c, NA) for c in header])

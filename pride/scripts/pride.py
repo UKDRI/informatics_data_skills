@@ -371,7 +371,9 @@ def generate_minimal_rows(accession, files, defaults, local_dir=None):
 
 def write_minimal_tsv(rows, out):
     with open(out, "w", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
+        # LF, not csv.writer's default CRLF: a trailing \r ends up inside the last
+        # field's value when the pipeline reads the row.
+        w = csv.writer(fh, delimiter="\t", lineterminator="\n")
         w.writerow(MINIMAL_SDRF_COLUMNS)
         for r in rows:
             w.writerow([_safe_field(r.get(c, "")) for c in MINIMAL_SDRF_COLUMNS])
@@ -388,7 +390,8 @@ def complete_existing_sdrf(text, out, defaults, local_dir=None):
     df_idx = next((i for i, c in enumerate(header)
                    if _norm_col(c) == _norm_col("comment[data file]")), None)
     with open(out, "w", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
+        # LF, not csv.writer's default CRLF (see write_minimal_tsv)
+        w = csv.writer(fh, delimiter="\t", lineterminator="\n")
         w.writerow([_safe_field(c) for c in header + missing])
         extra = [defaults.get(c, "not available") for c in missing]
         for row in rows[1:]:
@@ -544,7 +547,8 @@ def write_metadata_tsv(rows, out):
             if k not in header:
                 header.append(k)
     with open(out, "w", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
+        # LF, not csv.writer's default CRLF (see DESIGN.md "Clean output fields")
+        w = csv.writer(fh, delimiter="\t", lineterminator="\n")
         w.writerow(header)
         for r in rows:
             w.writerow([r.get(c, NA) for c in header])

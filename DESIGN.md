@@ -14,7 +14,8 @@ Give an agent (or a human at the CLI) one consistent, mostly dependency-free way
 2. **List** and **download** the associated data files.
 3. Produce **pipeline inputs** — a harmonized `metadata.tsv` sample table,
    nf-core/scrnaseq or nf-core/rnaseq sample sheets, quantms/DIA-NN minimal SDRFs,
-   SLURM-ready bash download scripts, and SRA-tools two-step SLURM job scripts.
+   SLURM-ready bash download scripts, and SRA-tools SLURM job scripts (prefetch →
+   fasterq-dump, plus an optional cellranger-naming link step).
 4. Produce a **submission workbook** — fill the UK DRI FAIR-metadata Excel
    template for upload to the ADDI / AD Workbench data portal (`addi`).
 
@@ -59,7 +60,8 @@ data_skills/
 │   ├── scripts/sra.py
 │   └── templates/                # cluster-specific job-script boilerplate
 │       ├── run_prefetch.sh
-│       └── run_fasterq-dump.sh
+│       ├── run_fasterq-dump.sh
+│       └── run_link-cellranger-fastq.sh   # optional 3rd step (--cellranger-links)
 └── addi/
     ├── SKILL.md
     ├── scripts/addi.py
@@ -73,8 +75,10 @@ name is the skill `name`; `SKILL.md` frontmatter carries the trigger-rich
 
 `sra` is the first skill with a **`templates/`** folder: it holds literal,
 ready-to-edit SLURM job scripts carrying the UKDRI cluster specifics (partition,
-the sra-tools apptainer image, bind mounts, the `pigz` loop). They are the source
-of truth; the generator fills their `__TOKEN__` placeholders (see below). `addi`
+the sra-tools apptainer image, bind mounts, the `pigz` loop, the 10x
+read-orientation symlink loop). They are the source of truth; the generator fills
+their `__TOKEN__` placeholders (see below). Three scripts, each with its own token
+set; the third is written only when asked for (`--cellranger-links`). `addi`
 follows the same template-backed idea for a different file type: its `templates/`
 holds the shipped `.xlsx` submission workbook, which the generator opens and fills
 in place (see *addi* below).
@@ -126,7 +130,13 @@ in place (see *addi* below).
   value** are replaced with `_`, so no value can span lines, break a CSV/TSV row,
   or escape a shell comment / quoted argument. Ordinary spaces in free-text fields
   are preserved. A **tab is allowed only as the field separator** in the
-  tab-delimited outputs (`metadata.tsv`, `.sdrf.tsv`) — never within a value. The
+  tab-delimited outputs (`metadata.tsv`, `.sdrf.tsv`) — never within a value. Every
+  generated CSV/TSV row ends with a bare **LF**: `csv.writer` defaults to CRLF, whose
+  trailing `\r` becomes part of the last field's *value* for any consumer splitting on
+  `\n` — silently corrupting the final column (`fastq_2`, `strandedness`, the last SDRF
+  column, or `metadata.tsv`'s last extra characteristic). Pass `lineterminator="\n"` at
+  **every** `csv.writer` site: the nf-core sample sheets, the PRIDE `.sdrf.tsv`, and
+  `metadata.tsv` in all five skills that write one. The
   nf-core `sample` column is normalized to a conservative filename/CLI-safe set
   (`[A-Za-z0-9._-]`): whitespace and unsafe/control characters → `_`, while the safe
   and meaningful `.` and `-` are kept — because it becomes file paths and pipeline
@@ -151,6 +161,9 @@ in place (see *addi* below).
   `templates/` folder, and the generator does plain `__TOKEN__` substitution (`sra`).
   The template variant keeps the boilerplate readable and hand-editable; unflagged
   output is byte-identical to the committed template apart from the filled tokens.
+  Token sets are **per script**, not per skill: a skill may ship several templates,
+  and one may be emitted only on request (`sra`'s `run_link-cellranger-fastq.sh`).
+  The byte-identical-when-unflagged property therefore holds per template.
 
 ## Per-skill design
 
@@ -199,27 +212,103 @@ in place (see *addi* below).
 - Pure transform: reads an nf-core/scrnaseq or /rnaseq sample sheet (it keys off
   the `fastq_*` columns, so the extra `strandedness` column is ignored) or a plain
   URL list, and emits a bash script. No network calls.
+- **The bulk RNA-seq FASTQ route** (decision 3). Single-cell should go via `sra`
+  instead, and a sheet written with `--fastq-dir`/`--local-dir` holds local paths
+  rather than URLs, so it is not valid input here.
 
 ### sra (generator, template-backed)
-- The **NCBI SRA route** to FASTQ, complementary to the ENA hub: for runs not
-  mirrored to ENA, or when pulling directly from NCBI via sra-tools.
-- **Two sequential steps.** `run_prefetch.sh` downloads each SRR accession into
-  `.sra` files; `run_fasterq-dump.sh` extracts those to FASTQ and `pigz`-compresses
-  them. The prefetch output dir is wired to be the fasterq-dump input dir. The two
-  must run in order; the generator only writes them and **never submits** — it
-  prints the `sbatch --parsable` / `--dependency=afterok` serialization command.
+- The **NCBI SRA route** to FASTQ, via sra-tools: the recommended route for
+  single-cell reads, and the fallback for anything not mirrored to ENA (see *When to
+  prefer this skill* below).
+- **Two sequential steps, plus an optional third.** `run_prefetch.sh` downloads each
+  SRR accession into `.sra` files; `run_fasterq-dump.sh` extracts those to FASTQ and
+  `pigz`-compresses them (`_1` … `_4`). The prefetch output dir is wired to be the
+  fasterq-dump input dir. They must run in order; the generator only writes them and
+  **never submits** — it prints the `sbatch --parsable` / `--dependency=afterok`
+  serialization command.
+- **10x / cellranger read naming (optional third step).** `fasterq-dump
+  --include-technical --split-files` names its output **positionally**, so for 10x
+  Chromium data the real read pair is *not* `_1`/`_2` but the **last two files**:
+
+  | dumped files | `_1` | `_2` | `_3` | `_4` | typical case | `--read-map` |
+  |---|---|---|---|---|---|---|
+  | 2 | R1 | R2 | — | — | index reads not submitted | `1,2` (default) |
+  | 3 | I1 | R1 | R2 | — | single-index 10x | `2,3` |
+  | 4 | I1 | I2 | R1 | R2 | dual-index, e.g. Chromium 5′ | `3,4` |
+
+  Note the tension in that default: `1,2` is right for bulk and for a two-file 10x
+  run, but single-cell is this skill's *primary* use (decision 3), where `2,3` or
+  `3,4` is the common answer. So `--read-map` is better treated as a **per-study check
+  that must be made** than as a flag with a safe default — count the dumped files for
+  one run before submitting the link job.
+
+  `cellranger` is the default aligner for 10x reads in nf-core/scrnaseq, and
+  `cellranger count --fastqs` will not accept the dumped names at all: its FASTQ
+  parser requires the Illumina/bcl2fastq shape
+  `<sample>_S1_L001_R{1,2}_001.fastq.gz` — a bare `_R1.fastq.gz` is *not* matched.
+  nf-core/scrnaseq accepts that full form too, so one name serves both consumers and
+  there is no flag to choose between them. `--cellranger-links` therefore writes a
+  third job script, `run_link-cellranger-fastq.sh`, which creates **symlinks** in
+  that convention under `--link-dir` (default: the `--fastq-dir` value).
+  - **Symlinks, never renames.** `run_fasterq-dump.sh`'s resume guard tests for
+    `<run>_2.fastq{,.gz}`, so renaming would silently re-trigger a full re-dump; and
+    the index reads stay on disk for the workflows that need them (`cellrangermulti`,
+    feature barcoding). `ln -sfnr` makes the step idempotent and keeps the directory
+    relocatable.
+  - **A separate script, not a step inside the dump loop.** The dump job is 32 CPUs
+    × 7 days over a whole study under `set -e`; a naming problem on one run must not
+    abort the extraction of the rest, and correcting it must not mean re-queueing a
+    multi-day job to create two symlinks.
+  - **The read mapping is declared, not inferred.** `--read-map <r1>,<r2>` (default
+    `1,2`) states which dumped files are R1 (barcode+UMI) and R2 (cDNA) — the same
+    *explicit-user-declaration-where-inference-is-unreliable* stance as the
+    sample-sheet `--assay` flag. As a verification aid the script echoes each file's
+    first-record read length and **warns** when the declared R1 is not 24–32 bp
+    (16 bp barcode + 10–12 bp UMI), since a reversed mapping yields plausible-looking
+    garbage counts rather than an error. One `--read-map` applies to the whole
+    directory, so a study mixing 3′ and 5′ runs needs its accession list — and its
+    FASTQ output directory — split. The default is `1,2` wherever the names are
+    *constructed* (here, and in a `--fastq-dir` sheet), because a dumped `_N` carries
+    no information beyond its position; only the archive-URL sheet has informative
+    names to fall back on a heuristic for.
+  - **The samplesheet references the links, not the dumped names.** `ena`/`geo`/
+    `arrayexpress` `samplesheet --fastq-dir DIR --fastq-naming cellranger` writes
+    `<DIR>/<run>_S1_L001_R{1,2}_001.fastq.gz` — a name *lookup*, with the read
+    structure already resolved by the link job. The read structure is never *inferred*
+    from archive metadata, which cannot express it (ENA's `fastq_ftp` count often
+    differs from what `fasterq-dump` emits; a runtable reports only
+    `SINGLE`/`PAIRED`) — it is always declared. Declare it **once per route**: to the
+    link job here, or to the `samplesheet` command directly on the ENA-URL route where
+    there is nothing to link (see *sample sheets* below).
+  - **Links are named per run, not per biological sample.** The prefix is the run
+    accession, independent of `--group-by`, because that is what the dumped files are
+    named. nf-core concatenates rows sharing a `sample`, so this is transparent there;
+    a direct `cellranger count` sees one *sample* per run and needs them listed
+    (`--sample SRR111,SRR222`).
 - **Input** is a one-accession-per-line list — either an exact file path or a
   directory containing `SRR_Acc_List.txt`. Upstream skills own list creation:
   `geo runtable` writes `SRR_Acc_List.txt` directly; from `ena`, take the
   `run_accession` column of a `report`/`filereport` into a one-per-line list.
-- For **ENA-hosted** runs this skill is the *alternative*, not the default — the
-  recommended route is the direct FASTQ download script (`ena samplesheet` →
-  `fastq-download-script`). Use `sra` when runs are not mirrored to ENA, or when the
-  NCBI `prefetch`/`fasterq-dump` path is specifically wanted.
+- **When to prefer this skill** — it depends on the assay, not on where the data
+  sits:
+  - **Single-cell (`--assay scrna`): this is the recommended route**, even for
+    ENA-hosted runs. ENA's mirrored 10x FASTQs are unreliable for read structure
+    (technical reads inconsistently present and named, `fastq_ftp` count not
+    descriptive), so `fasterq-dump --include-technical` plus `--read-map` /
+    `--cellranger-links` gets the cDNA read right by construction, where the URL route
+    depends on the caller having guessed the read structure correctly. See decision 3.
+  - **Bulk RNA-seq (`--assay bulk`): the ENA download script is the default**
+    (`ena samplesheet` → `fastq-download-script`) — one or two files per run and
+    informative names, so there is nothing for this skill to fix. Use `sra` for bulk
+    only when runs are not mirrored to ENA, or when the NCBI path is specifically
+    wanted.
+  - **Proteomics: not applicable** — `pride` handles `.raw`/`.zip` files; there are
+    no reads to extract or name.
 - **Image** defaults to the UKDRI `.sif`; `--sif PATH` overrides, or `--docker
   IMAGE` sets `sif=docker://IMAGE` so apptainer pulls it. The `apptainer exec` line
   is identical either way (apptainer accepts a `docker://` URI).
-- Runs `scripts/sra.py job-scripts`, filling `templates/run_{prefetch,fasterq-dump}.sh`.
+- Runs `scripts/sra.py job-scripts`, filling `templates/run_{prefetch,fasterq-dump}.sh`
+  — plus `templates/run_link-cellranger-fastq.sh` with `--cellranger-links`.
 
 ### addi (generator, template-backed — ADDI / AD Workbench FAIR-metadata workbook)
 - Produces a **submission workbook** rather than querying a repository or building
@@ -574,10 +663,50 @@ One row per run; rows sharing a `sample` value are concatenated by the pipeline.
 deliberately not interchangeable; only this one is a closed two-value choice, because
 each value maps to a specific pipeline's column layout.
 
-- **Pairing**: R1/R2 detected from filename (`_1`/`_2`, `R1`/`R2`); index reads
-  (`_I1`, `_R3`, `_3`) are dropped; falls back to positional order.
+- **Read selection.** Which two files become `fastq_1`/`fastq_2` is decided
+  differently depending on whether real filenames are available:
+  - *Archive URLs (`--local-dir`, or no flag) — filename heuristic*: R1/R2 from the
+    name (`_1`/`_2`, `R1`/`R2`), index reads (`_I1`, `_I2`, `_R3`, `_3`) dropped,
+    positional order as the fallback. Correct for bulk RNA-seq and for a 10x run
+    submitted as two files.
+  - *`--fastq-dir` — no filenames to inspect*: the paths are **constructed** from the
+    run accession, so there is no heuristic to run. The suffixes are `_1`/`_2` (or
+    `<run>.fastq.gz` when the layout is `SINGLE`) unless `--read-map` says otherwise.
+  - *`--read-map <r1>,<r2>` — declared positionally* in both modes: 1-based over the
+    run's files sorted by name (archive URLs) or over the dumped `_N` suffixes
+    (`--fastq-dir`). Required whenever a 10x run's technical reads are separate files,
+    because then the **last two** are the real pair: 3 files (single index) → `2,3`;
+    4 files (dual index, e.g. Chromium 5′) → `3,4`. Not a `sra`-only concern — an
+    ENA-hosted 3-file 10x submission has the same shape, and there the heuristic picks
+    `_1`/`_2` (index and barcode) and **drops the cDNA read**. `sra
+    --cellranger-links` takes the same 1-based declaration (see `sra` above); keep the
+    two consistent for one study. Not needed with `--fastq-naming cellranger`, where
+    the link job already resolved it.
 - **`--group-by`** chooses which field becomes `sample` (default `sample_accession`).
-- **`--local-dir`** emits local paths matching the `download` layout instead of URLs.
+- **Where the paths point** — one closed choice, default first:
+
+  | mode | `fastq_1` / `fastq_2` |
+  |---|---|
+  | *(no flag)* | remote archive URLs — the input to `fastq-download-script` |
+  | `--local-dir DIR` | `<DIR>/<run>/<archive basename>` — the `download` layout |
+  | `--fastq-dir DIR` (`--fastq-naming sra`, default) | `<DIR>/<run>_1.fastq.gz`/`_2.fastq.gz`, or `<DIR>/<run>.fastq.gz` single-end — flat `fasterq-dump` output, `--read-map` selecting the suffixes |
+  | `--fastq-dir DIR --fastq-naming cellranger` | `<DIR>/<run>_S1_L001_R{1,2}_001.fastq.gz` — the symlinks from `sra job-scripts --cellranger-links` |
+
+  The three local modes are **terminal**: they name files already on disk, so such a
+  sheet is a pipeline input and *not* valid input to `fastq-download-script`, which
+  expects URLs. `--local-dir` and `--fastq-dir` are mutually exclusive.
+- **Which route to pair the sheet with** (decision 3): for **`--assay bulk`** the
+  default no-flag sheet of ENA URLs feeds `fastq-download-script`, and none of the 10x
+  machinery above is needed. For **`--assay scrna`** prefer the `sra` route and a
+  `--fastq-dir` sheet, because the archive-URL route cannot describe a 10x run's read
+  structure reliably.
+- **10x is opt-in, never assumed.** `--assay scrna` does **not** imply 10x Chromium:
+  plate-based protocols (Smart-seq2) and 10x run through `alevin`/`kallisto`/
+  `starsolo` need no cellranger naming and use the default. Only `--fastq-naming
+  cellranger` commits to the Chromium/cellranger convention, and it requires
+  `--assay scrna`. Neither `--read-map` nor `--fastq-naming` alters the default bulk
+  or non-10x paths — both are off unless asked for, and neither exists on `pride`,
+  whose `.sdrf.tsv` has no read columns at all.
 - **Field hygiene**: the `sample` value must be normalized to a conservative
   filename/CLI-safe set (`[A-Za-z0-9._-]`; whitespace and unsafe/control chars →
   `_`, keeping `.`/`-`), warning on rewrite and **erroring on a collision** (two
@@ -628,22 +757,39 @@ comment or quoted argument into an executable line.
   `--ext` filters by extension; `--unzip` appends `unzip` steps for `.zip`
   archives (e.g. Bruker `.d` directories). Same SLURM/tool options.
 
-A third generator, **`sra`**, is a complementary FASTQ route rather than a transfer
-script: instead of curl/wget over ENA URLs, it emits a two-step **sra-tools compute
-job** (`prefetch` → `fasterq-dump`, run via apptainer) from an `SRR_Acc_List.txt`.
-Use it for runs not mirrored to ENA or when pulling directly from NCBI. It is
-template-backed (see `sra` above) and never submits.
+The third generator, **`sra`**, is a compute job rather than a transfer script:
+instead of curl/wget over ENA URLs, it emits a two-step **sra-tools job**
+(`prefetch` → `fasterq-dump`, run via apptainer) from an `SRR_Acc_List.txt` —
+optionally three-step, adding a `--cellranger-links` symlink step that gives 10x
+reads cellranger-compatible R1/R2 names. It is template-backed (see `sra` above) and
+never submits.
+
+The two FASTQ routes are **split by assay, not ranked overall** (decision 3):
+`fastq-download-script` is the route for **bulk** RNA-seq, `sra` the route for
+**single-cell**, where only `fasterq-dump` exposes the 10x read structure reliably.
+`sra` also covers anything — bulk included — not mirrored to ENA.
 
 Typical pipelines:
 
 ```
-# ENA FASTQ — recommended default route (direct HTTPS download)
-ena samplesheet PRJEB1787 ─► samplesheet.csv
+# BULK RNA-seq (--assay bulk) — recommended route: ENA direct HTTPS download
+ena samplesheet PRJEB1787 --assay bulk ─► samplesheet.csv
 fastq-download-script samplesheet.csv --tool curl ─► download_fastq.sh ─► sbatch
 
-# NCBI SRA route — default for SRA-only data (e.g. via GEO), and the ENA alternative
+# SINGLE-CELL (--assay scrna) — recommended route: sra, for the 10x read structure
 geo runtable GSE110009 ─► SRR_Acc_List.txt
+sra job-scripts --srr-list SRR_Acc_List.txt --cellranger-links --read-map 3,4
+    ─► run_prefetch.sh + run_fasterq-dump.sh + run_link-cellranger-fastq.sh ─► sbatch (in order)
+geo samplesheet GSE110009 --assay scrna --fastq-dir ./fastq --fastq-naming cellranger
+    ─► samplesheet.csv (─► nf-core/scrnaseq, aligner cellranger)
+
+# BULK not mirrored to ENA — the sra route without any 10x naming
 sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq-dump.sh ─► sbatch (in order)
+ena samplesheet PRJNA1234 --assay bulk --fastq-dir ./fastq ─► samplesheet.csv
+
+# PROTEOMICS — different domain entirely; no reads, no R1/R2
+pride download-script PXD012345 ─► download_raw.sh ─► sbatch
+pride samplesheet PXD012345 ─► PXD012345.sdrf.tsv
 ```
 
 ## Key design decisions
@@ -654,14 +800,29 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
    template (see decision 10).
 2. **Self-contained skills over a shared library** — a skill must survive being
    copied out of the collection, so helpers are duplicated intentionally.
-3. **ENA as the FASTQ hub** — GEO and ArrayExpress do not host raw reads, so both
-   resolve to ENA. GEO uses the lightweight SOFT text endpoint
-   (`acc.cgi?...&form=text&view=brief`) to find the linked BioProject/SRA rather
-   than downloading the (large) series matrix. For ENA-hosted data the recommended
-   default is the FASTQ download script (`ena samplesheet` → `fastq-download-script`,
-   direct HTTPS). The `sra` skill is the deliberate **alternative route**: for runs
-   not mirrored to ENA, or when pulling straight from NCBI, it goes via sra-tools
-   (`prefetch`/`fasterq-dump`) instead of ENA URLs.
+3. **ENA as the metadata hub; the FASTQ route depends on the assay** — GEO and
+   ArrayExpress do not host raw reads, so both resolve to ENA for metadata. GEO uses
+   the lightweight SOFT text endpoint (`acc.cgi?...&form=text&view=brief`) to find
+   the linked BioProject/SRA rather than downloading the (large) series matrix. Which
+   route then fetches the reads is **not one default but two**:
+   - **Bulk RNA-seq (`--assay bulk`) → ENA direct HTTPS** (`ena samplesheet` →
+     `fastq-download-script`). One or two files per run, informative archive
+     filenames, nothing to reorder — the download script is simpler, needs no
+     apptainer, and no compute job.
+   - **Single-cell RNA-seq (`--assay scrna`) → the `sra` route**
+     (`prefetch` → `fasterq-dump` → `--cellranger-links`). ENA's mirrored 10x FASTQs
+     cannot be relied on for this: technical reads are inconsistently present and
+     inconsistently named, and the `fastq_ftp` file count does not reliably describe
+     the run's read structure — so the archive-URL route can drop the cDNA read
+     (Known limitations) with no way to detect it from metadata alone.
+     `fasterq-dump --include-technical --split-files` instead reproduces the
+     submitted spot structure deterministically as `_1` … `_4`, which `--read-map`
+     can then address and the link step name canonically. Paying for a compute job
+     buys correctness that the URL route cannot offer.
+
+   `sra` remains the route for **any** run not mirrored to ENA, bulk included.
+   None of this touches **proteomics**: `pride` fetches `.raw`/`.zip` files, has no
+   reads, no R1/R2, and no `--read-map`.
 4. **One harmonized metadata schema across all sources** — repositories name the
    same biological facts differently; mapping them to a shared core column set
    (with `NA` for absent fields) while promoting any further characteristic to its
@@ -681,10 +842,10 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
    scripts carry UKDRI specifics (apptainer image, bind mounts, `pigz` loop) that
    read far better as an editable job script than as Python string fragments, so
    they live under `templates/` and the generator only substitutes tokens.
-9. **Generate, don't submit; document serialization** — `sra` writes the two
-   scripts and prints the `sbatch --dependency=afterok` command, but never runs
-   `sbatch`. The prefetch→fasterq-dump ordering is enforced by the user (or that
-   dependency); the tool only writes the scripts and never runs them, like the
+9. **Generate, don't submit; document serialization** — `sra` writes the scripts
+   and prints the two- or three-job `sbatch --dependency=afterok` chain, but never
+   runs `sbatch`. The prefetch→fasterq-dump→link ordering is enforced by the user (or
+   that dependency); the tool only writes the scripts and never runs them, like the
    other script generators.
 10. **Fill the template in place, don't rebuild it (`addi`)** — the workbook's
     dropdowns, per-cell prompts, cell colors and hidden controlled-vocabulary sheet
@@ -706,6 +867,25 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
     term cannot corrupt a dropdown. The safety property deliberately kept is **never guess
     a person**: the fallback is always the *template's* own institutional value, never
     anything inferred from the environment or the user's identity.
+12. **Symlink into the Illumina convention, don't rename — and pick the name that
+    satisfies both consumers (`sra`)** — 10x reads must reach `cellranger` as
+    `<sample>_S1_L001_R{1,2}_001.fastq.gz`, while `fasterq-dump` produces positional
+    `_1` … `_4` in which the real pair is the *last two* files. Three options were
+    weighed: one is unsafe, one is only half the answer. **Renaming** is unsafe: the
+    dump script's resume guard keys on `<run>_2.fastq{,.gz}`, so a rename silently
+    re-triggers a full re-dump, and the index reads other 10x workflows need would be
+    gone. **Fixing it only in the sample sheet** is half the answer: a declared
+    `--read-map` does let the sheet point at `_3`/`_4` directly — and that is exactly
+    how the ENA-URL route is fixed, where there is nothing to link — but it leaves a
+    directory whose `_1`/`_2` still read as the primary pair to the next tool or human,
+    and it does nothing for anyone running `cellranger count` on that directory. So the
+    two layers ship together, as complements rather than alternatives. Symlinks created
+    by a **separate, opt-in job** are cheap, idempotent (`ln -sfnr`), leave the dumped
+    files untouched, and isolate a naming mistake from the multi-day extraction it
+    depends on. The link name is the **full** bcl2fastq form rather than the shorter
+    `_R1`/`_R2` because it is a strict superset:
+    `cellranger`'s own FASTQ parser rejects a bare `_R1` while nf-core/scrnaseq accepts
+    either — one name, both consumers, no flag to choose between them.
 
 ## Verified endpoint reference
 
@@ -727,7 +907,9 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
 4. Verify each subcommand against a live accession before documenting it.
 5. If it emits a cluster script that is mostly fixed boilerplate, keep that script
    in a `templates/` folder with `__TOKEN__` placeholders and fill it by
-   substitution (see `sra`) rather than string-building it in Python.
+   substitution (see `sra`) rather than string-building it in Python. A skill may
+   ship several templates with independent token sets, and one of them may be
+   optional — emitted only when a flag asks for it (`sra --cellranger-links`).
 
 ## Known limitations
 
@@ -736,14 +918,32 @@ sra job-scripts --srr-list SRR_Acc_List.txt ─► run_prefetch.sh + run_fasterq
 - **PRIDE generate-mode placeholders** (acquisition method, enzyme, tolerances,
   modifications, factor value) are best-effort guesses — PRIDE metadata does not
   expose per-run values — and must be reviewed before running quantms.
-- **R1/R2 pairing** is filename-heuristic; unusual naming may need manual fixup,
-  and 10x barcode/cDNA orientation should be confirmed for the chemistry.
+- **R1/R2 pairing** is filename-heuristic by default and **wrong for any 10x run whose
+  technical reads were submitted as separate files** — for a 3-file submission it picks
+  the index and barcode reads and drops the cDNA read. It is the caller's job to notice
+  (count the files for one run) and pass `--read-map`; nothing detects it. This is the
+  reason single-cell is routed through `sra` rather than ENA URLs (decision 3): on the
+  archive-URL route the file count is not even a trustworthy signal of the read
+  structure. In practice this affects `--assay scrna` — bulk runs normally have one or
+  two files, and proteomics has no reads at all. Unusual naming may still need
+  manual fixup, and 10x barcode/cDNA orientation should be confirmed for the chemistry.
+- **`--read-map` is declared, not verified.** A wrong value produces plausible-looking
+  garbage counts rather than an error. On the `sra` link step the job log's per-file
+  first-record read lengths (and the 24–32 bp R1 warning) are the only guard; on the
+  sample-sheet side there is no guard at all, since no file is read. Check once per
+  study. 10x v1 chemistry (14 bp barcode plus a *separate* 10 bp UMI read) has no valid
+  two-file mapping and cannot be expressed by `--read-map` at all.
 - **Large studies** download sequentially; for scale, prefer ENA Aspera links or a
   SLURM job array over the generated per-file script.
 - **`sra` job scripts** assume the compute node has `apptainer` and `pigz` and the
-  UKDRI bind mounts (`/nfsdata,/data,/shared`); `--docker` pulls the image on first
-  exec (pre-pull to a `.sif` for many accessions); controlled-access/dbGaP runs need
+  UKDRI bind mounts (`/nfsdata,/data,/shared`) — and, for `--cellranger-links`, GNU
+  coreutils `ln --relative` plus `zcat`; `--docker` pulls the image on first exec
+  (pre-pull to a `.sif` for many accessions); controlled-access/dbGaP runs need
   NGC credentials that the generated scripts do not set up.
+- **The `sra` link step globs its input directory**, like the dump step it follows —
+  it does not read the SRR list. A FASTQ directory shared between studies therefore
+  gets symlinks for every run in it, all under a single `--read-map`; split the
+  accession list and the output directory when a study mixes chemistries.
 - **Output field hygiene** is a *cleaning* rule (offending characters replaced with
   `_`), not escape-encoding — a value containing a newline is made safe but not
   round-trippable, so a cleaned field cannot be mapped back to its original bytes.

@@ -256,6 +256,109 @@ def fastq_pair(urls):
     return "", ""
 
 
+# ---- local FASTQ names: fasterq-dump output / cellranger symlinks ----
+# (see DESIGN.md, `sra` and "Cross-cutting feature: sample sheets")
+#
+# The Illumina/bcl2fastq shape that cellranger's own FASTQ parser requires — a bare
+# _R1.fastq.gz is NOT matched by it, while nf-core/scrnaseq accepts this form too.
+CELLRANGER_R1 = "_S1_L001_R1_001.fastq.gz"
+CELLRANGER_R2 = "_S1_L001_R2_001.fastq.gz"
+
+_READ_MAP_RE = re.compile(r"([1-9]),([1-9])")
+
+
+def parse_read_map(value):
+    """Validate '<r1>,<r2>' 1-based read positions; None when not given."""
+    if not value:
+        return None
+    m = _READ_MAP_RE.fullmatch(value.strip())
+    if not m:
+        raise SystemExit(
+            f"--read-map must be '<r1>,<r2>' with 1-based positions (e.g. 3,4), got "
+            f"{value!r}. For a 10x run whose technical reads are stored as separate "
+            "files: 3 files (single index) -> 2,3; 4 files (dual index) -> 3,4.")
+    r1, r2 = int(m.group(1)), int(m.group(2))
+    if r1 == r2:
+        raise SystemExit(f"--read-map R1 and R2 must differ, got {value!r}.")
+    return r1, r2
+
+
+def fastq_names_cellranger(run, fastq_dir):
+    """Paths of the symlinks written by `sra job-scripts --cellranger-links`."""
+    return (os.path.join(fastq_dir, run + CELLRANGER_R1),
+            os.path.join(fastq_dir, run + CELLRANGER_R2))
+
+
+def fastq_names_sra(run, layout, fastq_dir, read_map=None):
+    """fasterq-dump output names: <run>_1.fastq.gz/_2.fastq.gz, or <run>.fastq.gz
+    for a SINGLE layout. `read_map` selects other suffixes, e.g. (3, 4).
+
+    These names are *constructed*, so no filename heuristic runs here. With
+    --include-technical a 10x run yields 3-4 files whose _1/_2 are index/barcode
+    reads rather than the cDNA pair — pass a read map, or use naming 'cellranger'.
+    """
+    if read_map:
+        r1, r2 = read_map
+        return (os.path.join(fastq_dir, f"{run}_{r1}.fastq.gz"),
+                os.path.join(fastq_dir, f"{run}_{r2}.fastq.gz"))
+    if (layout or "").strip().upper().startswith("PAIRED"):
+        return (os.path.join(fastq_dir, f"{run}_1.fastq.gz"),
+                os.path.join(fastq_dir, f"{run}_2.fastq.gz"))
+    return os.path.join(fastq_dir, f"{run}.fastq.gz"), ""
+
+
+def local_fastq_names(run, layout, fastq_dir, naming, read_map=None):
+    """--fastq-dir dispatch: 'cellranger' symlink names, else fasterq-dump names."""
+    if naming == "cellranger":
+        if not (layout or "").strip().upper().startswith("PAIRED"):
+            print(f"warning: {run} looks single-end; the cellranger link job skips "
+                  "single-end runs, so this path may not exist", file=sys.stderr)
+        return fastq_names_cellranger(run, fastq_dir)
+    return fastq_names_sra(run, layout, fastq_dir, read_map)
+
+
+def pick_by_read_map(urls, read_map, run=""):
+    """Select (fastq_1, fastq_2) from a run's archive URLs by 1-based position.
+
+    Bypasses fastq_pair: for a 10x run whose technical reads are separate files the
+    heuristic drops the cDNA read (see DESIGN.md "Read selection").
+    """
+    ordered = sorted((u for u in urls if u), key=lambda u: u.rsplit("/", 1)[-1])
+    r1, r2 = read_map
+    if max(r1, r2) > len(ordered):
+        raise SystemExit(
+            f"--read-map {r1},{r2} needs at least {max(r1, r2)} files but run "
+            f"{run or '?'} has {len(ordered)}. A study mixing chemistries needs one "
+            "run of sheets per read layout.")
+    return ordered[r1 - 1], ordered[r2 - 1]
+
+
+def check_fastq_opts(args):
+    """Guardrails for the path/naming flags; returns the parsed read map.
+
+    See DESIGN.md "Where the paths point" — the modes are a closed, mutually
+    exclusive choice.
+    """
+    fastq_dir = getattr(args, "fastq_dir", None)
+    naming = getattr(args, "fastq_naming", None)
+    if naming and not fastq_dir:
+        raise SystemExit("--fastq-naming only applies with --fastq-dir DIR.")
+    if fastq_dir and getattr(args, "local_dir", None):
+        raise SystemExit(
+            "--fastq-dir and --local-dir are mutually exclusive: --fastq-dir names the "
+            "flat fasterq-dump output, --local-dir the per-run `download` layout.")
+    if naming == "cellranger":
+        if args.assay != "scrna":
+            raise SystemExit(
+                "--fastq-naming cellranger describes a 10x barcode/cDNA read pair; use "
+                "--assay scrna, or --fastq-naming sra for bulk data.")
+        if getattr(args, "read_map", None):
+            print("warning: --read-map is ignored with --fastq-naming cellranger — the "
+                  "link job already resolved which reads are R1/R2", file=sys.stderr)
+            return None
+    return parse_read_map(getattr(args, "read_map", None))
+
+
 def get_sdrf_text(accession):
     files = list_files(accession)
     sdrf = [f for f in files if classify(f) == "sdrf"]
@@ -283,7 +386,9 @@ def write_samplesheet(rows, out, assay, strandedness="auto"):
     cols = list(SAMPLESHEET_COLS) + (["strandedness"] if assay == "bulk" else [])
     rows = sorted(rows, key=lambda x: (x["sample"], x["fastq_1"]))
     with open(out, "w", newline="") as fh:
-        w = csv.writer(fh)
+        # LF, not csv.writer's default CRLF: a trailing \r ends up inside the last
+        # field's value when the pipeline reads the row.
+        w = csv.writer(fh, lineterminator="\n")
         w.writerow(cols)
         for r in rows:
             row = dict(r)
@@ -294,6 +399,7 @@ def write_samplesheet(rows, out, assay, strandedness="auto"):
 
 
 def cmd_samplesheet(args):
+    read_map = check_fastq_opts(args)
     rows = list(csv.reader(io.StringIO(get_sdrf_text(args.accession)), delimiter="\t"))
     header = [h.strip() for h in rows[0]]
 
@@ -336,7 +442,24 @@ def cmd_samplesheet(args):
             urls = ena_run_fastq(g["run"])  # fall back to ENA for this run
         if not urls:
             continue
-        f1, f2 = fastq_pair(urls)
+        if args.fastq_dir:
+            # Names are constructed from the run accession, so there must be one.
+            if not g["run"]:
+                raise SystemExit(
+                    f"--fastq-dir needs a run accession to build filenames, but SDRF "
+                    f"group {key!r} has no Comment[ENA_RUN]. Drop --fastq-dir, or add "
+                    "the run accessions.")
+            # The SDRF has no layout column; the URI count is the available signal.
+            layout = "PAIRED" if len(urls) >= 2 else "SINGLE"
+            f1, f2 = local_fastq_names(g["run"], layout, args.fastq_dir,
+                                       args.fastq_naming, read_map)
+            out_rows.append({"sample": (g["sample"] or g["run"] or ""),
+                             "fastq_1": f1, "fastq_2": f2})
+            continue
+        if read_map:
+            f1, f2 = pick_by_read_map(urls, read_map, g["run"])
+        else:
+            f1, f2 = fastq_pair(urls)
         if args.local_dir and g["run"]:
             f1 = os.path.join(args.local_dir, g["run"], f1.rsplit("/", 1)[-1]) if f1 else ""
             f2 = os.path.join(args.local_dir, g["run"], f2.rsplit("/", 1)[-1]) if f2 else ""
@@ -439,7 +562,8 @@ def write_metadata_tsv(rows, out):
             if k not in header:
                 header.append(k)
     with open(out, "w", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
+        # LF, not csv.writer's default CRLF (see DESIGN.md "Clean output fields")
+        w = csv.writer(fh, delimiter="\t", lineterminator="\n")
         w.writerow(header)
         for r in rows:
             w.writerow([r.get(c, NA) for c in header])
@@ -592,6 +716,21 @@ def main():
     ss.add_argument("--out", default="samplesheet.csv")
     ss.add_argument("--local-dir",
                     help="write local paths <dir>/<run>/<file> instead of FASTQ URLs")
+    ss.add_argument("--fastq-dir", metavar="DIR",
+                    help="write paths into the flat fasterq-dump output dir (the `sra` "
+                         "skill's --fastq-dir) instead of FASTQ URLs; names are built "
+                         "from Comment[ENA_RUN], which must be present. Mutually "
+                         "exclusive with --local-dir")
+    ss.add_argument("--fastq-naming", choices=["sra", "cellranger"],
+                    help="with --fastq-dir: 'sra' -> <run>_1.fastq.gz/_2.fastq.gz "
+                         "(default), 'cellranger' -> the "
+                         "<run>_S1_L001_R{1,2}_001.fastq.gz symlinks written by "
+                         "`sra job-scripts --cellranger-links` (--assay scrna only)")
+    ss.add_argument("--read-map", metavar="R1,R2",
+                    help="declare which reads are the cDNA pair, 1-based (e.g. 3,4). "
+                         "Needed for a 10x run whose technical reads are separate files: "
+                         "3 files -> 2,3; 4 files (dual index) -> 3,4. Without it the "
+                         "R1/R2 filename heuristic runs and would drop the cDNA read")
     ss.set_defaults(func=cmd_samplesheet)
 
     args = p.parse_args()
