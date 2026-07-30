@@ -83,22 +83,42 @@ python scripts/ena.py samplesheet PRJEB1787 --assay scrna                  # ENA
 python scripts/ena.py samplesheet PRJEB1787 --assay bulk --strandedness reverse
 python scripts/ena.py samplesheet PRJEB1787 --assay scrna --group-by sample_title
 python scripts/ena.py samplesheet PRJEB1787 --assay bulk --local-dir ./ena_out/PRJEB1787
+
+# single-cell, after the `sra` skill's jobs have run
+python scripts/ena.py samplesheet PRJEB1787 --assay scrna \
+    --fastq-dir ./fastq --fastq-naming cellranger
+python scripts/ena.py samplesheet PRJEB1787 --assay scrna --read-map 3,4   # ENA URLs, 4-file 10x
 ```
 
 - `--group-by` chooses which run field becomes `sample` (default
   `sample_accession`; also `sample_alias`, `sample_title`, `experiment_accession`).
-- `--local-dir` writes local paths `<dir>/<run>/<file>` (matching `download`
-  output) instead of URLs.
+- **Where the paths point** — one closed choice, default first:
+
+  | mode | `fastq_1` / `fastq_2` |
+  |------|------------------------|
+  | *(no flag)* | ENA https URLs — the input to `fastq-download-script` |
+  | `--local-dir DIR` | `<DIR>/<run>/<file>`, matching `download` output |
+  | `--fastq-dir DIR` | `<DIR>/<run>_1.fastq.gz`/`_2.fastq.gz` — the flat `fasterq-dump` output of the `sra` skill |
+  | `--fastq-dir DIR --fastq-naming cellranger` | `<DIR>/<run>_S1_L001_R{1,2}_001.fastq.gz` — the symlinks from `sra job-scripts --cellranger-links` (`--assay scrna` only) |
+
+  The local modes name files already on disk, so such a sheet is a pipeline input and
+  *not* valid input to `fastq-download-script`. `--local-dir` and `--fastq-dir` are
+  mutually exclusive.
+- **`--read-map R1,R2` for 10x.** The default R1/R2 pairing is filename-based and is
+  **wrong for any 10x run whose technical reads were submitted as separate files** —
+  for a 3-file run it picks the index and barcode reads and *drops the cDNA read*.
+  Declare it instead: 3 files → `--read-map 2,3`; 4 files (dual index, e.g. Chromium
+  5′) → `--read-map 3,4`. Nothing detects this; count the files for one run
+  (`runs PRJEB1787`) and check. Not needed with `--fastq-naming cellranger`, where the
+  link job already resolved it.
 - `expected_cells` / `seq_center` are optional scrnaseq columns; add them by hand
-  if needed. Check that `fastq_1` (barcodes) and `fastq_2` (cDNA) are the right way
-  round for your 10x chemistry.
-- **Recommended route to FASTQ**: turn the URL samplesheet into a cluster download
-  script with the `fastq-download-script` skill (direct HTTPS download of the ENA
-  FASTQ files). Prefer this for ENA-hosted data.
-- *Alternative*: pull the same runs from NCBI with sra-tools instead — feed a
-  `run_accession` list (`report --result read_run --fields run_accession`) to the
-  `sra` skill. Use only when the ENA download is unsuitable (e.g. runs not mirrored
-  to ENA, or you specifically want the NCBI `prefetch`/`fasterq-dump` path).
+  if needed.
+- **Route to FASTQ depends on the assay.** For **bulk**, turn the URL samplesheet into
+  a cluster download script with the `fastq-download-script` skill (direct HTTPS) —
+  that is the recommended route. For **single-cell**, prefer the `sra` skill even for
+  ENA-hosted runs: ENA's mirrored 10x FASTQs are unreliable for read structure, and
+  only `fasterq-dump --include-technical` exposes it deterministically. Feed a
+  `run_accession` list (`report --result read_run --fields run_accession`) to `sra`.
 
 ## How access works (for ad-hoc queries)
 

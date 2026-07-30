@@ -81,12 +81,25 @@ required** — the archive can't tell you whether the study is single-cell or bu
 python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay scrna              # FASTQ URLs
 python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay bulk --strandedness reverse
 python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay scrna --local-dir ./fastq
+
+# single-cell, after the `sra` skill's jobs have run
+python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay scrna \
+    --fastq-dir ./fastq --fastq-naming cellranger
+python scripts/arrayexpress.py samplesheet E-MTAB-13991 --assay scrna --read-map 3,4
 ```
 
 - Errors clearly if the SDRF has no FASTQ (e.g. array-only studies, or reads only
   in ENA under controlled access).
-- Feed the samplesheet to the `fastq-download-script` skill for a cluster download
-  script.
+- `--local-dir`, `--fastq-dir`, `--fastq-naming` and `--read-map` behave as in the
+  `ena` skill — including that the default filename pairing **drops the cDNA read of a
+  10x run whose technical reads were submitted separately** (3 files →
+  `--read-map 2,3`; 4 files → `3,4`).
+- `--fastq-dir` builds filenames from `Comment[ENA_RUN]`, so it errors if the SDRF has
+  no run accessions — there is nothing to name the files after.
+- **For bulk**, feed the samplesheet to the `fastq-download-script` skill for a cluster
+  download script. **For single-cell**, prefer the `sra` skill (via a `Comment[ENA_RUN]`
+  accession list), because only `fasterq-dump --include-technical` exposes the 10x read
+  structure deterministically.
 
 ## MAGE-TAB: the two key files
 

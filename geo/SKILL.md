@@ -103,34 +103,58 @@ required** — the archive can't tell you whether the study is single-cell or bu
 python scripts/geo.py samplesheet GSE110009 --assay scrna              # ENA https URLs
 python scripts/geo.py samplesheet GSE110009 --assay bulk --strandedness reverse
 python scripts/geo.py samplesheet GSE110009 --assay scrna --local-dir ./fastq
+
+# single-cell, after the `sra` skill's jobs have run
+python scripts/geo.py samplesheet GSE110009 --assay scrna \
+    --fastq-dir ./fastq --fastq-naming cellranger
+python scripts/geo.py samplesheet GSE110009 --assay scrna --read-map 3,4   # ENA URLs, 4-file 10x
 ```
 
-- `--group-by` / `--local-dir` behave as in the `ena` skill.
+- `--group-by`, `--local-dir`, `--fastq-dir`, `--fastq-naming` and `--read-map` behave
+  as in the `ena` skill — including that the default filename pairing **drops the cDNA
+  read of a 10x run whose technical reads were submitted separately** (3 files →
+  `--read-map 2,3`; 4 files → `3,4`).
 - If the series has no public FASTQ in ENA (e.g. human data under dbGaP controlled
   access), the command reports that clearly — the reads are not downloadable here.
-- Feed the resulting samplesheet to the `fastq-download-script` skill for a
-  cluster download script.
+- **For bulk**, feed the resulting URL samplesheet to the `fastq-download-script` skill
+  for a cluster download script. **For single-cell**, prefer the `sra` skill (see
+  below) even when the runs are mirrored to ENA.
 
-### From a runtable (SRA Toolkit fastq names)
+### From a runtable (fasterq-dump fastq names)
 
-When you fetch reads with the SRA Toolkit (`prefetch` + `fasterq-dump` over
-`SRR_Acc_List.txt`) instead of ENA, the local files are named by run accession.
-`--from-runtable` builds the sample sheet **offline** from a local `SraRunTable.csv`
-(from `runtable`) so the fastq columns match those filenames — single vs paired is
-read from the table's `LibraryLayout` column:
+When you fetch reads with sra-tools (`prefetch` + `fasterq-dump` over
+`SRR_Acc_List.txt`, i.e. the `sra` skill) instead of ENA, the local files are named by
+run accession. `--from-runtable` builds the sample sheet **offline** from a local
+`SraRunTable.csv` (from `runtable`) so the fastq columns match those filenames — single
+vs paired is read from the table's `LibraryLayout` column:
 
-- `SINGLE` → `fastq_1 = <dir>/SRRxxxxxxx.fastq`, `fastq_2` empty
-- `PAIRED` → `fastq_1 = <dir>/SRRxxxxxxx_1.fastq`, `fastq_2 = <dir>/SRRxxxxxxx_2.fastq`
+- `SINGLE` → `fastq_1 = <dir>/SRRxxxxxxx.fastq.gz`, `fastq_2` empty
+- `PAIRED` → `fastq_1 = <dir>/SRRxxxxxxx_1.fastq.gz`, `fastq_2 = <dir>/SRRxxxxxxx_2.fastq.gz`
+
+(`.fastq.gz`, because the `sra` skill's dump job `pigz`-compresses its output.)
 
 `--fastq-dir DIR` is required (it prefixes every fastq path). No ENA request is made.
 In this mode `--group-by` names a runtable column (e.g. `SampleName`, `Sample`,
 `Experiment`); the default falls back to `SampleName` → `Sample` → `Run`.
 
+For **10x** data the `_1`/`_2` default is usually wrong — the runtable's `PAIRED` says
+nothing about how many files `fasterq-dump --include-technical` produced. Either point
+at the cellranger symlinks, or declare the suffixes:
+
 ```bash
 python scripts/geo.py runtable    GSE110009 --out ./GSE110009
-# ... prefetch / fasterq-dump using ./GSE110009/SRR_Acc_List.txt -> ./fastq/ ...
+# ... the `sra` skill's prefetch / fasterq-dump using ./GSE110009/SRR_Acc_List.txt -> ./fastq/ ...
 python scripts/geo.py samplesheet GSE110009 --assay bulk \
     --from-runtable ./GSE110009/SraRunTable.csv --fastq-dir ./fastq
+
+# 10x: the symlinks written by `sra job-scripts --cellranger-links`
+python scripts/geo.py samplesheet GSE110009 --assay scrna \
+    --from-runtable ./GSE110009/SraRunTable.csv --fastq-dir ./fastq \
+    --fastq-naming cellranger
+
+# 10x without the link step: name the dumped files directly
+python scripts/geo.py samplesheet GSE110009 --assay scrna \
+    --from-runtable ./GSE110009/SraRunTable.csv --fastq-dir ./fastq --read-map 3,4
 ```
 
 Download flags: `--matrix` (default), `--soft`, `--miniml`, `--suppl`. Combine as
